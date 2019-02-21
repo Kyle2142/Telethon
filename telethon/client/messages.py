@@ -1,6 +1,5 @@
 import asyncio
 import itertools
-import logging
 import time
 
 from async_generator import async_generator, yield_
@@ -8,10 +7,8 @@ from async_generator import async_generator, yield_
 from .messageparse import MessageParseMethods
 from .uploads import UploadMethods
 from .buttons import ButtonMethods
-from .. import helpers, utils
+from .. import helpers, utils, errors
 from ..tl import types, functions
-
-__log__ = logging.getLogger(__name__)
 
 
 class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
@@ -175,13 +172,13 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
             else:
                 offset_id = 1
 
-        if not from_user:
-            from_id = None
-        else:
-            from_id = await self.get_input_entity(from_user)
-            if not isinstance(from_id, (
+        if from_user:
+            from_user = await self.get_input_entity(from_user)
+            if not isinstance(from_user, (
                     types.InputPeerUser, types.InputPeerSelf)):
-                from_id = None  # Ignore from_user unless it's a user
+                from_user = None  # Ignore from_user unless it's a user
+
+        from_id = (await self.get_peer_id(from_user)) if from_user else None
 
         limit = float('inf') if limit is None else int(limit)
         if not entity:
@@ -196,9 +193,20 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
                 offset_id=offset_id,
                 limit=1
             )
-        elif search is not None or filter or from_id:
+        elif search is not None or filter or from_user:
             if filter is None:
                 filter = types.InputMessagesFilterEmpty()
+
+            # Telegram completely ignores `from_id` in private chats
+            if isinstance(entity, (types.InputPeerUser, types.InputPeerSelf)):
+                # Don't bother sending `from_user` (it's ignored anyway),
+                # but keep `from_id` defined above to check it locally.
+                from_user = None
+            else:
+                # Do send `from_user` to do the filtering server-side,
+                # and set `from_id` to None to avoid checking it locally.
+                from_id = None
+
             request = functions.messages.SearchRequest(
                 peer=entity,
                 q=search or '',
@@ -211,19 +219,8 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
                 max_id=0,
                 min_id=0,
                 hash=0,
-                from_id=from_id
+                from_id=from_user
             )
-
-            if not isinstance(entity, (
-                    types.InputPeerUser, types.InputPeerSelf)):
-                from_id = None
-            else:
-                # Telegram completely ignores `from_id` in private
-                # chats, so we need to do this check client-side.
-                if isinstance(from_id, types.InputPeerSelf):
-                    from_id = await self.get_peer_id('me')
-                else:
-                    from_id = from_id.user_id
         else:
             request = functions.messages.GetHistoryRequest(
                 peer=entity,
@@ -352,8 +349,8 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
         specified it makes sense that it should return the entirety of it.
 
         If `ids` is present in the *named* arguments and is not a list,
-        a single :tl:`Message` will be returned for convenience instead
-        of a list.
+        a single `Message <telethon.tl.custom.message.Message>` will be
+        returned for convenience instead of a list.
         """
         total = [0]
         kwargs['_total'] = total
@@ -400,7 +397,7 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
             entity (`entity`):
                 To who will it be sent.
 
-            message (`str` | :tl:`Message`):
+            message (`str` | `Message <telethon.tl.custom.message.Message>`):
                 The message to be sent, or another message object to resend.
 
                 The maximum length for a message is 35,000 bytes or 4,096
@@ -408,13 +405,15 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
                 and you should slice them manually if the text to send is
                 longer than said length.
 
-            reply_to (`int` | :tl:`Message`, optional):
+            reply_to (`int` | `Message <telethon.tl.custom.message.Message>`, optional):
                 Whether to reply to a message or not. If an integer is provided,
                 it should be the ID of the message that it should reply to.
 
             parse_mode (`object`, optional):
-                See the `TelegramClient.parse_mode` property for allowed
-                values. Markdown parsing will be used by default.
+                See the `TelegramClient.parse_mode
+                <telethon.client.messageparse.MessageParseMethods.parse_mode>`
+                property for allowed values. Markdown parsing will be used by
+                default.
 
             link_preview (`bool`, optional):
                 Should the link preview be shown?
@@ -513,15 +512,15 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
 
         result = await self(request)
         if isinstance(result, types.UpdateShortSentMessage):
-            to_id, cls = utils.resolve_id(utils.get_peer_id(entity))
             message = types.Message(
                 id=result.id,
-                to_id=cls(to_id),
+                to_id=utils.get_peer(entity),
                 message=message,
                 date=result.date,
                 out=result.out,
                 media=result.media,
-                entities=result.entities
+                entities=result.entities,
+                reply_markup=request.reply_markup
             )
             message._finish_init(self, {}, entity)
             return message
@@ -537,7 +536,7 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
             entity (`entity`):
                 To which entity the message(s) will be forwarded.
 
-            messages (`list` | `int` | :tl:`Message`):
+            messages (`list` | `int` | `Message <telethon.tl.custom.message.Message>`):
                 The message(s) to forward, or their integer IDs.
 
             from_peer (`entity`):
@@ -553,6 +552,10 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
         Returns:
             The list of forwarded `telethon.tl.custom.message.Message`,
             or a single one if a list wasn't provided as input.
+
+            Note that if all messages are invalid (i.e. deleted) the call
+            will fail with ``MessageIdInvalidError``. If only some are
+            invalid, the list will have ``None`` instead of those messages.
         """
         single = not utils.is_list_like(messages)
         if single:
@@ -571,8 +574,8 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
                 )
             except StopIteration:
                 raise ValueError(
-                    'from_chat must be given if integer IDs are used'
-                )
+                    'from_peer must be given if integer IDs are used'
+                ) from None
 
         req = functions.messages.ForwardMessagesRequest(
             from_peer=from_peer,
@@ -597,7 +600,14 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
                 update.message._finish_init(self, entities, entity)
                 id_to_message[update.message.id] = update.message
 
-        result = [id_to_message[random_to_id[rnd]] for rnd in req.random_id]
+        # Trying to forward only deleted messages causes `MESSAGE_ID_INVALID`
+        # but forwarding valid and invalid messages in the same call makes the
+        # call succeed, although the API won't return those messages thus
+        # `random_to_id[rnd]` would `KeyError`. Check the key beforehand.
+        result = [id_to_message[random_to_id[rnd]]
+                  if rnd in random_to_id else None
+                  for rnd in req.random_id]
+
         return result[0] if single else result
 
     async def edit_message(
@@ -608,24 +618,28 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
         Edits the given message ID (to change its contents or disable preview).
 
         Args:
-            entity (`entity` | :tl:`Message`):
+            entity (`entity` | `Message <telethon.tl.custom.message.Message>`):
                 From which chat to edit the message. This can also be
                 the message to be edited, and the entity will be inferred
                 from it, so the next parameter will be assumed to be the
                 message text.
 
-            message (`int` | :tl:`Message` | `str`):
-                The ID of the message (or :tl:`Message` itself) to be edited.
-                If the `entity` was a :tl:`Message`, then this message will be
-                treated as the new text.
+            message (`int` | `Message <telethon.tl.custom.message.Message>` | `str`):
+                The ID of the message (or `Message
+                <telethon.tl.custom.message.Message>` itself) to be edited.
+                If the `entity` was a `Message
+                <telethon.tl.custom.message.Message>`, then this message
+                will be treated as the new text.
 
             text (`str`, optional):
                 The new text of the message. Does nothing if the `entity`
-                was a :tl:`Message`.
+                was a `Message <telethon.tl.custom.message.Message>`.
 
             parse_mode (`object`, optional):
-                See the `TelegramClient.parse_mode` property for allowed
-                values. Markdown parsing will be used by default.
+                See the `TelegramClient.parse_mode
+                <telethon.client.messageparse.MessageParseMethods.parse_mode>`
+                property for allowed values. Markdown parsing will be used by
+                default.
 
             link_preview (`bool`, optional):
                 Should the link preview be shown?
@@ -692,7 +706,7 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
                 be ``None`` for normal chats, but **must** be present
                 for channels and megagroups.
 
-            message_ids (`list` | `int` | :tl:`Message`):
+            message_ids (`list` | `int` | `Message <telethon.tl.custom.message.Message>`):
                 The IDs (or ID) or messages to be deleted.
 
             revoke (`bool`, optional):
@@ -742,7 +756,7 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
             entity (`entity`):
                 The chat where these messages are located.
 
-            message (`list` | :tl:`Message`):
+            message (`list` | `Message <telethon.tl.custom.message.Message>`):
                 Either a list of messages or a single message.
 
             max_id (`int`):
@@ -797,7 +811,12 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
 
         from_id = None  # By default, no need to validate from_id
         if isinstance(entity, (types.InputChannel, types.InputPeerChannel)):
-            r = await self(functions.channels.GetMessagesRequest(entity, ids))
+            try:
+                r = await self(
+                    functions.channels.GetMessagesRequest(entity, ids))
+            except errors.MessageIdsEmptyError:
+                # All IDs were invalid, use a dummy result
+                r = types.messages.MessagesNotModified(len(ids))
         else:
             r = await self(functions.messages.GetMessagesRequest(ids))
             if entity:
@@ -812,7 +831,9 @@ class MessageMethods(UploadMethods, ButtonMethods, MessageParseMethods):
                     for x in itertools.chain(r.users, r.chats)}
 
         # Telegram seems to return the messages in the order in which
-        # we asked them for, so we don't need to check it ourselves.
+        # we asked them for, so we don't need to check it ourselves,
+        # unless some messages were invalid in which case Telegram
+        # may decide to not send them at all.
         #
         # The passed message IDs may not belong to the desired entity
         # since the user can enter arbitrary numbers which can belong to

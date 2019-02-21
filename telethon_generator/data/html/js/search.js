@@ -1,7 +1,7 @@
 root = document.getElementById("main_div");
 root.innerHTML = `
 <!-- You can append '?q=query' to the URL to default to a search -->
-<input id="searchBox" type="text" onkeydown="updateSearch(event)"
+<input id="searchBox" type="text" onkeyup="updateSearch(event)"
        placeholder="Search for requests and types…" />
 
 <div id="searchDiv">
@@ -215,6 +215,18 @@ function getQuery(name) {
         var pair = vars[i].split("=");
         if (pair[0] == name)
             return decodeURI(pair[1]);
+    }
+}
+
+document.onkeydown = function (e) {
+    if (e.key == '/' || e.key == 's' || e.key == 'S') {
+        if (document.activeElement != searchBox) {
+            searchBox.focus();
+            return false;
+        }
+    } else if (e.key == '?') {
+        alert('Pressing any of: /sS\nWill focus the search bar\n\n' +
+              'Pressing: enter\nWill navigate to the first match')
     }
 }
 

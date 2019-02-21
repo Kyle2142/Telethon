@@ -1,6 +1,5 @@
 import hashlib
 import io
-import logging
 import os
 import pathlib
 import re
@@ -12,7 +11,68 @@ from .users import UserMethods
 from .. import utils, helpers
 from ..tl import types, functions, custom
 
-__log__ = logging.getLogger(__name__)
+try:
+    import PIL
+    import PIL.Image
+except ImportError:
+    PIL = None
+
+
+class _CacheType:
+    """Like functools.partial but pretends to be the wrapped class."""
+    def __init__(self, cls):
+        self._cls = cls
+
+    def __call__(self, *args, **kwargs):
+        return self._cls(*args, file_reference=b'', **kwargs)
+
+    def __eq__(self, other):
+        return self._cls == other
+
+
+def _resize_photo_if_needed(
+        file, is_image, width=1280, height=1280, background=(255, 255, 255)):
+
+    # https://github.com/telegramdesktop/tdesktop/blob/12905f0dcb9d513378e7db11989455a1b764ef75/Telegram/SourceFiles/boxes/photo_crop_box.cpp#L254
+    if (not is_image
+            or PIL is None
+            or (isinstance(file, io.IOBase) and not file.seekable())):
+        return file
+
+    before = file.tell() if isinstance(file, io.IOBase) else None
+    if isinstance(file, bytes):
+        file = io.BytesIO(file)
+
+    try:
+        with PIL.Image.open(file) as image:
+            if image.width <= width and image.height <= height:
+                return file
+
+            image.thumbnail((width, height), PIL.Image.ANTIALIAS)
+
+            alpha_index = image.mode.find('A')
+            if alpha_index == -1:
+                # If the image mode doesn't have alpha
+                # channel then don't bother masking it away.
+                result = image
+            else:
+                # We could save the resized image with the original format, but
+                # JPEG often compresses better -> smaller size -> faster upload
+                # We need to mask away the alpha channel ([3]), since otherwise
+                # IOError is raised when trying to save alpha channels in JPEG.
+                result = PIL.Image.new('RGB', image.size, background)
+                result.paste(image, mask=image.split()[alpha_index])
+
+            buffer = io.BytesIO()
+            result.save(buffer, 'JPEG')
+            buffer.seek(0)
+            return buffer
+
+    except IOError:
+        return file
+    finally:
+        if before is not None:
+            file.seek(before, io.SEEK_SET)
 
 
 class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
@@ -20,11 +80,11 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
     # region Public methods
 
     async def send_file(
-            self, entity, file, *, caption='', force_document=False,
+            self, entity, file, *, caption=None, force_document=False,
             progress_callback=None, reply_to=None, attributes=None,
             thumb=None, allow_cache=True, parse_mode=(),
             voice_note=False, video_note=False, buttons=None, silent=None,
-            **kwargs):
+            supports_streaming=False, **kwargs):
         """
         Sends a file to the specified entity.
 
@@ -59,7 +119,7 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
                 A callback function accepting two parameters:
                 ``(sent bytes, total)``.
 
-            reply_to (`int` | :tl:`Message`):
+            reply_to (`int` | `Message <telethon.tl.custom.message.Message>`):
                 Same as `reply_to` from `send_message`.
 
             attributes (`list`, optional):
@@ -81,8 +141,10 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
                 or thumb than those that were used when the file was cached.
 
             parse_mode (`object`, optional):
-                See the `TelegramClient.parse_mode` property for allowed
-                values. Markdown parsing will be used by default.
+                See the `TelegramClient.parse_mode
+                <telethon.client.messageparse.MessageParseMethods.parse_mode>`
+                property for allowed values. Markdown parsing will be used by
+                default.
 
             voice_note (`bool`, optional):
                 If ``True`` the audio will be sent as a voice note.
@@ -108,14 +170,33 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
                 channel or not. Defaults to ``False``, which means it will
                 notify them. Set it to ``True`` to alter this behaviour.
 
+            supports_streaming (`bool`, optional):
+                Whether the sent video supports streaming or not. Note that
+                Telegram only recognizes as streamable some formats like MP4,
+                and others like AVI or MKV will not work. You should convert
+                these to MP4 before sending if you want them to be streamable.
+                Unsupported formats will result in ``VideoContentTypeError``.
+
         Notes:
             If the ``hachoir3`` package (``hachoir`` module) is installed,
             it will be used to determine metadata from audio and video files.
+
+            If the `pillow` package is installed and you are sending a photo,
+            it will be resized to fit within the maximum dimensions allowed
+            by Telegram to avoid ``errors.PhotoInvalidDimensionsError``. This
+            cannot be done if you are sending :tl:`InputFile`, however.
 
         Returns:
             The `telethon.tl.custom.message.Message` (or messages) containing
             the sent file, or messages if a list of them was passed.
         """
+        # i.e. ``None`` was used
+        if not file:
+            raise TypeError('Cannot use {!r} as file'.format(file))
+
+        if not caption:
+            caption = ''
+
         # First check if the user passed an iterable, in which case
         # we may want to send as an album if all are photo files.
         if utils.is_list_like(file):
@@ -147,6 +228,7 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
                     progress_callback=progress_callback, reply_to=reply_to,
                     attributes=attributes, thumb=thumb, voice_note=voice_note,
                     video_note=video_note, buttons=buttons, silent=silent,
+                    supports_streaming=supports_streaming,
                     **kwargs
                 ))
 
@@ -167,8 +249,13 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
             file, force_document=force_document,
             progress_callback=progress_callback,
             attributes=attributes,  allow_cache=allow_cache, thumb=thumb,
-            voice_note=voice_note, video_note=video_note
+            voice_note=voice_note, video_note=video_note,
+            supports_streaming=supports_streaming
         )
+
+        # e.g. invalid cast from :tl:`MessageMediaWebPage`
+        if not media:
+            raise TypeError('Cannot use {!r} as file'.format(file))
 
         markup = self.build_reply_markup(buttons)
         request = functions.messages.SendMediaRequest(
@@ -181,8 +268,8 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
         return msg
 
     async def _send_album(self, entity, files, caption='',
-                    progress_callback=None, reply_to=None,
-                    parse_mode=(), silent=None):
+                          progress_callback=None, reply_to=None,
+                          parse_mode=(), silent=None):
         """Specialized version of .send_file for albums"""
         # We don't care if the user wants to avoid cache, we will use it
         # anyway. Why? The cached version will be exactly the same thing
@@ -314,6 +401,12 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
             else:
                 file_name = str(file_id)
 
+        # If the file name lacks extension, add it if possible.
+        # Else Telegram complains with `PHOTO_EXT_INVALID_ERROR`
+        # even if the uploaded image is indeed a photo.
+        if not os.path.splitext(file_name)[-1]:
+            file_name += utils._get_extension(file)
+
         # Determine whether the file is too big (over 10MB) or not
         # Telegram does make a distinction between smaller or larger files
         is_large = file_size > 10 * 1024 * 1024
@@ -329,14 +422,14 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
             hash_md5.update(file)
             if use_cache:
                 cached = self.session.get_file(
-                    hash_md5.digest(), file_size, cls=use_cache
+                    hash_md5.digest(), file_size, cls=_CacheType(use_cache)
                 )
                 if cached:
                     return cached
 
         part_count = (file_size + part_size - 1) // part_size
-        __log__.info('Uploading file of %d bytes in %d chunks of %d',
-                     file_size, part_count, part_size)
+        self._log[__name__].info('Uploading file of %d bytes in %d chunks of %d',
+                                 file_size, part_count, part_size)
 
         with open(file, 'rb') if isinstance(file, str) else BytesIO(file)\
                 as stream:
@@ -355,8 +448,8 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
 
                 result = await self(request)
                 if result:
-                    __log__.debug('Uploaded %d/%d', part_index + 1,
-                                  part_count)
+                    self._log[__name__].debug('Uploaded %d/%d',
+                                              part_index + 1, part_count)
                     if progress_callback:
                         progress_callback(stream.tell(), file_size)
                 else:
@@ -375,29 +468,43 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
     async def _file_to_media(
             self, file, force_document=False,
             progress_callback=None, attributes=None, thumb=None,
-            allow_cache=True, voice_note=False, video_note=False):
+            allow_cache=True, voice_note=False, video_note=False,
+            supports_streaming=False):
         if not file:
             return None, None
 
         if isinstance(file, pathlib.Path):
             file = str(file.absolute())
 
+        as_image = utils.is_image(file) and not force_document
+
         if not isinstance(file, (str, bytes, io.IOBase)):
             # The user may pass a Message containing media (or the media,
             # or anything similar) that should be treated as a file. Try
             # getting the input media for whatever they passed and send it.
+            #
+            # We pass all attributes since these will be used if the user
+            # passed :tl:`InputFile`, and all information may be relevant.
             try:
-                return None, utils.get_input_media(file)
+                return (None, utils.get_input_media(
+                    file,
+                    is_photo=as_image,
+                    attributes=attributes,
+                    force_document=force_document,
+                    voice_note=voice_note,
+                    video_note=video_note,
+                    supports_streaming=supports_streaming
+                ))
             except TypeError:
                 return None, None  # Can't turn whatever was given into media
 
         media = None
         file_handle = None
-        as_image = utils.is_image(file) and not force_document
         use_cache = types.InputPhoto if as_image else types.InputDocument
         if not isinstance(file, str) or os.path.isfile(file):
             file_handle = await self.upload_file(
-                file, progress_callback=progress_callback,
+                _resize_photo_if_needed(file, as_image),
+                progress_callback=progress_callback,
                 use_cache=use_cache if allow_cache else None
             )
         elif re.match('https?://', file):
@@ -433,11 +540,14 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
                 attributes=attributes,
                 force_document=force_document,
                 voice_note=voice_note,
-                video_note=video_note
+                video_note=video_note,
+                supports_streaming=supports_streaming
             )
 
             input_kw = {}
             if thumb:
+                if isinstance(thumb, pathlib.Path):
+                    thumb = str(thumb.absolute())
                 input_kw['thumb'] = await self.upload_file(thumb)
 
             media = types.InputMediaUploadedDocument(
@@ -449,7 +559,7 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
         return file_handle, media
 
     async def _cache_media(self, msg, file, file_handle,
-                     force_document=False):
+                           force_document=False):
         if file and msg and isinstance(file_handle,
                                        custom.InputSizedFile):
             # There was a response message and we didn't use cached

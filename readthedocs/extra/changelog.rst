@@ -14,6 +14,191 @@ it can take advantage of new goodies!
 .. contents:: List of All Versions
 
 
+Layer Update (v1.5.5)
+=====================
+
+*Published at 2019/01/14*
+
++-----------------------+
+| Scheme layer used: 93 |
++-----------------------+
+
+There isn't an entry for v1.5.4 because it contained only one hot-fix
+regarding loggers. This update is slightly bigger so it deserves mention.
+
+Additions
+~~~~~~~~~
+
+* New ``supports_streaming`` parameter in `client.send_file
+  <telethon.client.uploads.UploadMethods.send_file>`.
+
+Bug fixes
+~~~~~~~~~
+
+* Dealing with mimetypes should cause less issues in systems like Windows.
+* Potentially fix alternative session storages that had issues with dates.
+
+Enhancements
+~~~~~~~~~~~~
+
+* Saner timeout defaults for conversations.
+* ``Path``-like files are now supported for thumbnails.
+* Added new hot-keys to the online documentation at
+  https://lonamiwebs.github.io/Telethon/ such as ``/`` to search.
+  Press ``?`` to view them all.
+
+
+Bug Fixes (v1.5.3)
+==================
+
+*Published at 2019/01/14*
+
+Several bug fixes and some quality of life enhancements.
+
+Breaking Changes
+~~~~~~~~~~~~~~~~
+
+* `message.edit <telethon.tl.custom.message.Message.edit>` now respects
+  the previous message buttons or link preview being hidden. If you want to
+  toggle them you need to explicitly set them. This is generally the desired
+  behaviour, but may cause some bots to have buttons when they shouldn't.
+
+Additions
+~~~~~~~~~
+
+* You can now "hide_via" when clicking on results from `client.inline_query
+  <telethon.client.bots.BotMethods.inline_query>` to @bing and @gif.
+* You can now further configure the logger Telethon uses to suit your needs.
+
+Bug fixes
+~~~~~~~~~
+
+* Fixes for ReadTheDocs to correctly build the documentation.
+* Fix :tl:`UserEmpty` not being expected when getting the input variant.
+* The message object returned when sending a message with buttons wouldn't
+  always contain the :tl:`ReplyMarkup`.
+* Setting email when configuring 2FA wasn't properly supported.
+* ``utils.resolve_bot_file_id`` now works again for photos.
+
+Enhancements
+~~~~~~~~~~~~
+
+* Chat and channel participants can now be used as peers.
+* Reworked README and examples at
+  https://github.com/LonamiWebs/Telethon/tree/master/telethon_examples
+
+
+Takeout Sessions (v1.5.2)
+=========================
+
+*Published at 2019/01/05*
+
+You can now easily start takeout sessions (also known as data export sessions)
+through `client.takeout() <telethon.client.account.AccountMethods.takeout>`.
+Some of the requests will have lower flood limits when done through the
+takeout session.
+
+Bug fixes
+~~~~~~~~~
+
+* The new `AdminLogEvent <telethon.tl.custom.adminlogevent.AdminLogEvent>`
+  had a bug that made it unusable.
+* `client.iter_dialogs() <telethon.client.dialogs.DialogMethods.iter_dialogs>`
+  will now locally check for the offset date, since Telegram ignores it.
+* Answering inline queries with media no works properly. You can now use
+  the library to create inline bots and send stickers through them!
+
+
+object.to_json() (v1.5.1)
+=========================
+
+*Published at 2019/01/03*
+
+The library already had a way to easily convert the objects the API returned
+into dictionaries through ``object.to_dict()``, but some of the fields are
+dates or ``bytes`` which JSON can't serialize directly.
+
+For convenience, a new ``object.to_json()`` has been added which will by
+default format both of those problematic types into something sensible.
+
+Additions
+~~~~~~~~~
+
+* New `client.iter_admin_log()
+  <telethon.client.chats.ChatMethods.iter_admin_log>` method.
+
+Bug fixes
+~~~~~~~~~
+
+* `client.is_connected()
+  <telethon.client.telegrambaseclient.TelegramBaseClient.is_connected>`
+  would be wrong when the initial connection failed.
+* Fixed ``UnicodeDecodeError`` when accessing the text of messages
+  with malformed offsets in their entities.
+* Fixed `client.get_input_entity()
+  <telethon.client.users.UserMethods.get_input_entity>` for integer IDs
+  that the client has not seen before.
+
+Enhancements
+~~~~~~~~~~~~
+
+* You can now configure the reply markup when using `Button
+  <telethon.tl.custom.button.Button>` as a bot.
+* More properties for `Message
+  <telethon.tl.custom.message.Message>` to make accessing media convenient.
+* Downloading to ``file=bytes`` will now return a ``bytes`` object
+  with the downloaded media.
+
+
+Polls with the Latest Layer (v1.5)
+==================================
+
+*Published at 2018/12/25*
+
++-----------------------+
+| Scheme layer used: 91 |
++-----------------------+
+
+This version doesn't really bring many new features, but rather focuses on
+updating the code base to support the latest available Telegram layer, 91.
+This layer brings polls, and you can create and manage them through Telethon!
+
+Breaking Changes
+~~~~~~~~~~~~~~~~
+
+* The layer change from 82 to 91 changed a lot of things in the raw API,
+  so be aware that if you rely on raw API calls, you may need to update
+  your code, in particular **if you work with files**. They have a new
+  ``file_reference`` parameter that you must provide.
+
+Additions
+~~~~~~~~~
+
+* New `client.is_bot() <telethon.client.users.UserMethods.is_bot>` method.
+
+Bug fixes
+~~~~~~~~~
+
+* Markdown and HTML parsing now behave correctly with leading whitespace.
+* HTTP connection should now work correctly again.
+* Using ``caption=None`` would raise an error instead of setting no caption.
+* ``KeyError`` is now handled properly when forwarding messages.
+* `button.click() <telethon.tl.custom.messagebutton.MessageButton.click>`
+  now works as expected for :tl:`KeyboardButtonGame`.
+
+Enhancements
+~~~~~~~~~~~~
+
+* Some improvements to the search in the full API and generated examples.
+* Using entities with ``access_hash = 0`` will now work in more cases.
+
+Internal changes
+~~~~~~~~~~~~~~~~
+
+* Some changes to the documentation and code generation.
+* 2FA code was updated to work under the latest layer.
+
+
 Error Descriptions in CSV files (v1.4.3)
 ========================================
 

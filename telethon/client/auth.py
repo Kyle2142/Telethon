@@ -7,7 +7,7 @@ import sys
 
 from .messageparse import MessageParseMethods
 from .users import UserMethods
-from .. import utils, helpers, errors
+from .. import utils, helpers, errors, password as pwd_mod
 from ..tl import types, functions
 
 
@@ -221,6 +221,22 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
         return self
 
+    def _parse_phone_and_hash(self, phone, phone_hash):
+        """
+        Helper method to both parse and validate phone and its hash.
+        """
+        phone = utils.parse_phone(phone) or self._phone
+        if not phone:
+            raise ValueError(
+                'Please make sure to call send_code_request first.'
+            )
+
+        phone_hash = phone_hash or self._phone_code_hash.get(phone, None)
+        if not phone_hash:
+            raise ValueError('You also need to provide a phone_code_hash.')
+
+        return phone, phone_hash
+
     async def sign_in(
             self, phone=None, code=None, *, password=None,
             bot_token=None, phone_code_hash=None):
@@ -248,9 +264,9 @@ class AuthMethods(MessageParseMethods, UserMethods):
                 Used to sign in as a bot. Not all requests will be available.
                 This should be the hash the @BotFather gave you.
 
-            phone_code_hash (`str`):
-                The hash returned by .send_code_request. This can be set to None
-                to use the last hash known.
+            phone_code_hash (`str`, optional):
+                The hash returned by `send_code_request`. This can be left as
+                ``None`` to use the last hash known for the phone to be used.
 
         Returns:
             The signed in user, or the information about
@@ -263,26 +279,17 @@ class AuthMethods(MessageParseMethods, UserMethods):
         if phone and not code and not password:
             return await self.send_code_request(phone)
         elif code:
-            phone = utils.parse_phone(phone) or self._phone
-            phone_code_hash = \
-                phone_code_hash or self._phone_code_hash.get(phone, None)
-
-            if not phone:
-                raise ValueError(
-                    'Please make sure to call send_code_request first.'
-                )
-            if not phone_code_hash:
-                raise ValueError('You also need to provide a phone_code_hash.')
+            phone, phone_code_hash = \
+                self._parse_phone_and_hash(phone, phone_code_hash)
 
             # May raise PhoneCodeEmptyError, PhoneCodeExpiredError,
             # PhoneCodeHashEmptyError or PhoneCodeInvalidError.
             result = await self(functions.auth.SignInRequest(
                 phone, phone_code_hash, str(code)))
         elif password:
-            salt = (await self(
-                functions.account.GetPasswordRequest())).current_salt
+            pwd = await self(functions.account.GetPasswordRequest())
             result = await self(functions.auth.CheckPasswordRequest(
-                helpers.get_password_hash(password, salt)
+                pwd_mod.compute_check(pwd, password)
             ))
         elif bot_token:
             result = await self(functions.auth.ImportBotAuthorizationRequest(
@@ -297,7 +304,8 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
         return self._on_login(result.user)
 
-    async def sign_up(self, code, first_name, last_name=''):
+    async def sign_up(self, code, first_name, last_name='',
+                      *, phone=None, phone_code_hash=None):
         """
         Signs up to Telegram if you don't have an account yet.
         You must call .send_code_request(phone) first.
@@ -317,6 +325,14 @@ class AuthMethods(MessageParseMethods, UserMethods):
             last_name (`str`, optional)
                 Optional last name.
 
+            phone (`str` | `int`, optional):
+                The phone to sign up. This will be the last phone used by
+                default (you normally don't need to set this).
+
+            phone_code_hash (`str`, optional):
+                The hash returned by `send_code_request`. This can be left as
+                ``None`` to use the last hash known for the phone to be used.
+
         Returns:
             The new created :tl:`User`.
         """
@@ -332,9 +348,12 @@ class AuthMethods(MessageParseMethods, UserMethods):
             sys.stderr.write("{}\n".format(t))
             sys.stderr.flush()
 
+        phone, phone_code_hash = \
+            self._parse_phone_and_hash(phone, phone_code_hash)
+
         result = await self(functions.auth.SignUpRequest(
-            phone_number=self._phone,
-            phone_code_hash=self._phone_code_hash.get(self._phone, ''),
+            phone_number=phone,
+            phone_code_hash=phone_code_hash,
             phone_code=str(code),
             first_name=first_name,
             last_name=last_name
@@ -352,6 +371,7 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
         Returns the input user parameter.
         """
+        self._bot = bool(user.bot)
         self._self_input_peer = utils.get_input_peer(user, allow_self=False)
         self._authorized = True
 
@@ -359,7 +379,7 @@ class AuthMethods(MessageParseMethods, UserMethods):
         # `catch_up` on all updates (and obtain necessary access hashes)
         # if they desire. The date parameter is ignored when pts = 1.
         self._state.pts = 1
-        self._state.date = datetime.datetime.now()
+        self._state.date = datetime.datetime.now(tz=datetime.timezone.utc)
 
         return user
 
@@ -383,7 +403,7 @@ class AuthMethods(MessageParseMethods, UserMethods):
         if not phone_hash:
             try:
                 result = await self(functions.auth.SendCodeRequest(
-                    phone, self.api_id, self.api_hash))
+                    phone, self.api_id, self.api_hash, types.CodeSettings()))
             except errors.AuthRestartError:
                 return self.send_code_request(phone, force_sms=force_sms)
 
@@ -414,19 +434,26 @@ class AuthMethods(MessageParseMethods, UserMethods):
         except errors.RPCError:
             return False
 
+        self._bot = None
         self._self_input_peer = None
         self._authorized = False
-        self._state = types.updates.State(0, 0, datetime.datetime.now(), 0, 0)
+        self._state = types.updates.State(
+            0, 0, datetime.datetime.now(tz=datetime.timezone.utc), 0, 0)
+
         self.disconnect()
         self.session.delete()
         return True
 
     async def edit_2fa(
             self, current_password=None, new_password=None,
-            *, hint='', email=None):
+            *, hint='', email=None, email_code_callback=None):
         """
         Changes the 2FA settings of the logged in user, according to the
         passed parameters. Take note of the parameter explanations.
+
+        Note that this method may be *incredibly* slow depending on the
+        prime numbers that must be used during the process to make sure
+        that everything is safe.
 
         Has no effect if both current and new password are omitted.
 
@@ -447,57 +474,64 @@ class AuthMethods(MessageParseMethods, UserMethods):
             Has no effect if ``new_password`` is not set.
 
         email (`str`, optional):
-            Recovery and verification email. Raises ``EmailUnconfirmedError``
-            if value differs from current one, and has no effect if
-            ``new_password`` is not set.
+            Recovery and verification email. If present, you must also
+            set `email_code_callback`, else it raises ``ValueError``.
+
+        email_code_callback (`callable`, optional):
+            If an email is provided, a callback that returns the code sent
+            to it must also be set. This callback may be asynchronous.
+            It should return a string with the code. The length of the
+            code will be passed to the callback as an input parameter.
+
+            If the callback returns an invalid code, it will raise
+            ``CodeInvalidError``.
 
         Returns:
             ``True`` if successful, ``False`` otherwise.
         """
-        raise NotImplemented
-
         if new_password is None and current_password is None:
             return False
 
-        pass_result = await self(functions.account.GetPasswordRequest())
-        if isinstance(
-                pass_result, types.account.NoPassword) and current_password:
+        if email and not callable(email_code_callback):
+            raise ValueError('email present without email_code_callback')
+
+        pwd = await self(functions.account.GetPasswordRequest())
+        pwd.new_algo.salt1 += os.urandom(32)
+        assert isinstance(pwd, types.account.Password)
+        if not pwd.has_password and current_password:
             current_password = None
 
-        salt_random = os.urandom(8)
-        salt = pass_result.new_salt + salt_random
-        if not current_password:
-            current_password_hash = salt
+        if current_password:
+            password = pwd_mod.compute_check(pwd, current_password)
         else:
-            current_password = (
-                pass_result.current_salt
-                + current_password.encode()
-                + pass_result.current_salt
-            )
-            current_password_hash = hashlib.sha256(current_password).digest()
+            password = types.InputCheckPasswordEmpty()
 
-        if new_password:  # Setting new password
-            new_password = salt + new_password.encode('utf-8') + salt
-            new_password_hash = hashlib.sha256(new_password).digest()
-            new_settings = types.account.PasswordInputSettings(
-                new_salt=salt,
-                new_password_hash=new_password_hash,
-                hint=hint
-            )
-            if email:  # If enabling 2FA or changing email
-                new_settings.email = email  # TG counts empty string as None
-            return await self(functions.account.UpdatePasswordSettingsRequest(
-                current_password_hash, new_settings=new_settings
-            ))
-        else:  # Removing existing password
-            return await self(functions.account.UpdatePasswordSettingsRequest(
-                current_password_hash,
+        if new_password:
+            new_password_hash = pwd_mod.compute_digest(
+                pwd.new_algo, new_password)
+        else:
+            new_password_hash = b''
+
+        try:
+            await self(functions.account.UpdatePasswordSettingsRequest(
+                password=password,
                 new_settings=types.account.PasswordInputSettings(
-                    new_salt=bytes(),
-                    new_password_hash=bytes(),
-                    hint=hint
+                    new_algo=pwd.new_algo,
+                    new_password_hash=new_password_hash,
+                    hint=hint,
+                    email=email,
+                    new_secure_settings=None
                 )
             ))
+        except errors.EmailUnconfirmedError as e:
+            code = email_code_callback(e.code_length)
+            if inspect.isawaitable(code):
+                code = await code
+
+            code = str(code)
+            await self(functions.account.ConfirmPasswordEmailRequest(code))
+
+        return True
 
     # endregion
 

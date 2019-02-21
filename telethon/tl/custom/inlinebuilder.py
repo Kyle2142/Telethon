@@ -43,8 +43,15 @@ class InlineBuilder:
         id (`str`, optional):
             The string ID to use for this result. If not present, it
             will be the SHA256 hexadecimal digest of converting the
-            request with empty ID to ``bytes()``, so that the ID will
-            be deterministic for the same input.
+            created :tl:`InputBotInlineResult` with empty ID to ``bytes()``,
+            so that the ID will be deterministic for the same input.
+
+            .. note::
+
+                If two inputs are exactly the same, their IDs will be the same
+                too. If you send two articles with the same ID, it will raise
+                ``ResultIdDuplicateError``. Consider giving them an explicit
+                ID if you need to send two results that are the same.
     """
     def __init__(self, client):
         self._client = client
@@ -113,7 +120,11 @@ class InlineBuilder:
                 Same as ``file`` for `client.send_file
                 <telethon.client.uploads.UploadMethods.send_file>`.
         """
-        fh = await self._client.upload_file(file, use_cache=types.InputPhoto)
+        try:
+            fh = utils.get_input_photo(file)
+        except TypeError:
+            fh = await self._client.upload_file(file, use_cache=types.InputPhoto)
+
         if not isinstance(fh, types.InputPhoto):
             r = await self._client(functions.messages.UploadMediaRequest(
                 types.InputPeerSelf(), media=types.InputMediaUploadedPhoto(fh)
@@ -125,8 +136,11 @@ class InlineBuilder:
             type='photo',
             photo=fh,
             send_message=await self._message(
-                text=text, parse_mode=parse_mode, link_preview=link_preview,
-                geo=geo, period=period,
+                text=text or '',
+                parse_mode=parse_mode,
+                link_preview=link_preview,
+                geo=geo,
+                period=period,
                 contact=contact,
                 game=game,
                 buttons=buttons
@@ -174,8 +188,12 @@ class InlineBuilder:
             else:
                 type = 'document'
 
-        use_cache = types.InputDocument if use_cache else None
-        fh = await self._client.upload_file(file, use_cache=use_cache)
+        try:
+            fh = utils.get_input_document(file)
+        except TypeError:
+            use_cache = types.InputDocument if use_cache else None
+            fh = await self._client.upload_file(file, use_cache=use_cache)
+
         if not isinstance(fh, types.InputDocument):
             attributes, mime_type = utils.get_attributes(
                 file,
@@ -200,8 +218,14 @@ class InlineBuilder:
             type=type,
             document=fh,
             send_message=await self._message(
-                text=text, parse_mode=parse_mode, link_preview=link_preview,
-                geo=geo, period=period,
+                # Empty string for text if there's media but text is None.
+                # We may want to display a document but send text; however
+                # default to sending the media (without text, i.e. stickers).
+                text=text or '',
+                parse_mode=parse_mode,
+                link_preview=link_preview,
+                geo=geo,
+                period=period,
                 contact=contact,
                 game=game,
                 buttons=buttons
@@ -247,8 +271,9 @@ class InlineBuilder:
             text=None, parse_mode=(), link_preview=True,
             geo=None, period=60, contact=None, game=False, buttons=None
     ):
-        args = (text, geo, contact, game)
-        if sum(1 for x in args if x) != 1:
+        # Empty strings are valid but false-y; if they're empty use dummy '\0'
+        args = ('\0' if text == '' else text, geo, contact, game)
+        if sum(1 for x in args if x is not None and x is not False) != 1:
             raise ValueError(
                 'Must set exactly one of text, geo, contact or game (set {})'
                 .format(', '.join(x[0] for x in zip(
@@ -256,7 +281,10 @@ class InlineBuilder:
             )
 
         markup = self._client.build_reply_markup(buttons, inline_only=True)
-        if text:
+        if text is not None:
+            if not text:  # Automatic media on empty string, like stickers
+                return types.InputBotInlineMessageMediaAuto('')
+
             text, msg_entities = await self._client._parse_message_text(
                 text, parse_mode
             )

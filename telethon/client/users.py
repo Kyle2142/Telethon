@@ -1,15 +1,14 @@
 import asyncio
 import itertools
-import logging
 import time
 
 from .telegrambaseclient import TelegramBaseClient
 from .. import errors, utils
 from ..errors import MultiError, RPCError
 from ..tl import TLObject, TLRequest, types, functions
+from ..helpers import retry_range
 
-__log__ = logging.getLogger(__name__)
-_NOT_A_REQUEST = TypeError('You can only invoke requests, not types!')
+_NOT_A_REQUEST = lambda: TypeError('You can only invoke requests, not types!')
 
 
 class UserMethods(TelegramBaseClient):
@@ -17,7 +16,7 @@ class UserMethods(TelegramBaseClient):
         requests = (request if utils.is_list_like(request) else (request,))
         for r in requests:
             if not isinstance(r, TLRequest):
-                raise _NOT_A_REQUEST
+                raise _NOT_A_REQUEST()
             await r.resolve(self, utils)
 
             # Avoid making the request if it's already in a flood wait
@@ -27,7 +26,8 @@ class UserMethods(TelegramBaseClient):
                 if diff <= 3:  # Flood waits below 3 seconds are "ignored"
                     self._flood_waited_requests.pop(r.CONSTRUCTOR_ID, None)
                 elif diff <= self.flood_sleep_threshold:
-                    __log__.info('Sleeping early for %ds on flood wait', diff)
+                    self._log[__name__].info(
+                        'Sleeping early for %ds on flood wait', diff)
                     await asyncio.sleep(diff, loop=self._loop)
                     self._flood_waited_requests.pop(r.CONSTRUCTOR_ID, None)
                 else:
@@ -35,7 +35,7 @@ class UserMethods(TelegramBaseClient):
 
         request_index = 0
         self._last_request = time.time()
-        for _ in range(self._request_retries):
+        for attempt in retry_range(self._request_retries):
             try:
                 future = self._sender.send(request, ordered=ordered)
                 if isinstance(future, list):
@@ -60,9 +60,13 @@ class UserMethods(TelegramBaseClient):
                     result = await future
                     self.session.process_entities(result)
                     return result
-            except (errors.ServerError, errors.RpcCallFailError) as e:
-                __log__.warning('Telegram is having internal issues %s: %s',
-                                e.__class__.__name__, e)
+            except (errors.ServerError, errors.RpcCallFailError,
+                    errors.RpcMcgetFailError) as e:
+                self._log[__name__].warning(
+                    'Telegram is having internal issues %s: %s',
+                    e.__class__.__name__, e)
+
+                await asyncio.sleep(2)
             except (errors.FloodWaitError, errors.FloodTestPhoneWaitError) as e:
                 if utils.is_list_like(request):
                     request = request[request_index]
@@ -71,21 +75,23 @@ class UserMethods(TelegramBaseClient):
                     [request.CONSTRUCTOR_ID] = time.time() + e.seconds
 
                 if e.seconds <= self.flood_sleep_threshold:
-                    __log__.info('Sleeping for %ds on flood wait', e.seconds)
+                    self._log[__name__].info('Sleeping for %ds on flood wait',
+                                             e.seconds)
                     await asyncio.sleep(e.seconds, loop=self._loop)
                 else:
                     raise
             except (errors.PhoneMigrateError, errors.NetworkMigrateError,
                     errors.UserMigrateError) as e:
-                __log__.info('Phone migrated to %d', e.new_dc)
+                self._log[__name__].info('Phone migrated to %d', e.new_dc)
                 should_raise = isinstance(e, (
-                    errors.PhoneMigrateError,  errors.NetworkMigrateError
+                    errors.PhoneMigrateError, errors.NetworkMigrateError
                 ))
                 if should_raise and await self.is_user_authorized():
                     raise
                 await self._switch_dc(e.new_dc)
 
-        raise ValueError('Number of retries reached 0')
+        raise ValueError('Request was unsuccessful {} time(s)'
+                         .format(attempt))
 
     # region Public methods
 
@@ -110,6 +116,7 @@ class UserMethods(TelegramBaseClient):
             me = (await self(
                 functions.users.GetUsersRequest([types.InputUserSelf()])))[0]
 
+            self._bot = me.bot
             if not self._self_input_peer:
                 self._self_input_peer = utils.get_input_peer(
                     me, allow_self=False
@@ -118,6 +125,15 @@ class UserMethods(TelegramBaseClient):
             return self._self_input_peer if input_peer else me
         except errors.UnauthorizedError:
             return None
+
+    async def is_bot(self):
+        """
+        Return ``True`` if the signed-in user is a bot, ``False`` otherwise.
+        """
+        if self._bot is None:
+            self._bot = (await self.get_me()).bot
+
+        return self._bot
 
     async def is_user_authorized(self):
         """
@@ -304,6 +320,33 @@ class UserMethods(TelegramBaseClient):
             # Also ignore Peer (0x2d45687 == crc32(b'Peer'))'s, lacking hash.
             return utils.get_input_peer(peer)
 
+        # If we're a bot and the user has messaged us privately users.getUsers
+        # will work with access_hash = 0. Similar for channels.getChannels.
+        # If we're not a bot but the user is in our contacts, it seems to work
+        # regardless. These are the only two special-cased requests.
+        peer = utils.get_peer(peer)
+        if isinstance(peer, types.PeerUser):
+            users = await self(functions.users.GetUsersRequest([
+                types.InputUser(peer.user_id, access_hash=0)]))
+            if users and not isinstance(users[0], types.UserEmpty):
+                # If the user passed a valid ID they expect to work for
+                # channels but would be valid for users, we get UserEmpty.
+                # Avoid returning the invalid empty input peer for that.
+                #
+                # We *could* try to guess if it's a channel first, and if
+                # it's not, work as a chat and try to validate it through
+                # another request, but that becomes too much work.
+                return utils.get_input_peer(users[0])
+        elif isinstance(peer, types.PeerChat):
+            return types.InputPeerChat(peer.chat_id)
+        elif isinstance(peer, types.PeerChannel):
+            try:
+                channels = await self(functions.channels.GetChannelsRequest([
+                    types.InputChannel(peer.channel_id, access_hash=0)]))
+                return utils.get_input_peer(channels.chats[0])
+            except errors.ChannelInvalidError:
+                pass
+
         raise ValueError(
             'Could not find the input entity for {!r}. Please read https://'
             'telethon.readthedocs.io/en/latest/extra/basic/entities.html to'
@@ -325,13 +368,12 @@ class UserMethods(TelegramBaseClient):
             return utils.get_peer_id(peer, add_mark=add_mark)
 
         try:
-            if peer.SUBCLASS_OF_ID in (0x2d45687, 0xc91c90b6):
+            if peer.SUBCLASS_OF_ID not in (0x2d45687, 0xc91c90b6):
                 # 0x2d45687, 0xc91c90b6 == crc32(b'Peer') and b'InputPeer'
-                return utils.get_peer_id(peer)
+                peer = await self.get_input_entity(peer)
         except AttributeError:
-            pass
+            peer = await self.get_input_entity(peer)
 
-        peer = await self.get_input_entity(peer)
         if isinstance(peer, types.InputPeerSelf):
             peer = await self.get_me(input_peer=True)
 

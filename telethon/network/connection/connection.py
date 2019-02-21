@@ -1,12 +1,9 @@
 import abc
 import asyncio
-import logging
 import socket
 import ssl as ssl_mod
 
 from ...errors import InvalidChecksumError
-
-__log__ = logging.getLogger(__name__)
 
 
 class Connection(abc.ABC):
@@ -21,10 +18,12 @@ class Connection(abc.ABC):
     ``ConnectionError``, which will raise when attempting to send if
     the client is disconnected (includes remote disconnections).
     """
-    def __init__(self, ip, port, *, loop, proxy=None):
+    def __init__(self, ip, port, dc_id, *, loop, loggers, proxy=None):
         self._ip = ip
         self._port = port
+        self._dc_id = dc_id  # only for MTProxy, it's an abstraction leak
         self._loop = loop
+        self._log = loggers[__name__]
         self._proxy = proxy
         self._reader = None
         self._writer = None
@@ -77,6 +76,9 @@ class Connection(abc.ABC):
                 await asyncio.open_connection(sock=s, loop=self._loop)
 
         self._connected = True
+        self._init_conn()
+        await self._writer.drain()
+
         self._send_task = self._loop.create_task(self._send_loop())
         self._recv_task = self._loop.create_task(self._recv_loop())
 
@@ -95,12 +97,6 @@ class Connection(abc.ABC):
 
         if self._writer:
             self._writer.close()
-
-    def clone(self):
-        """
-        Creates a clone of the connection.
-        """
-        return self.__class__(self._ip, self._port, loop=self._loop)
 
     def send(self, data):
         """
@@ -138,9 +134,9 @@ class Connection(abc.ABC):
             pass
         except Exception as e:
             if isinstance(e, ConnectionError):
-                __log__.info('The server closed the connection while sending')
+                self._log.info('The server closed the connection while sending')
             else:
-                __log__.exception('Unexpected exception in the send loop')
+                self._log.exception('Unexpected exception in the send loop')
 
             self.disconnect()
 
@@ -156,13 +152,13 @@ class Connection(abc.ABC):
             except Exception as e:
                 if isinstance(e, (ConnectionError, asyncio.IncompleteReadError)):
                     msg = 'The server closed the connection'
-                    __log__.info(msg)
+                    self._log.info(msg)
                 elif isinstance(e, InvalidChecksumError):
                     msg = 'The server response had an invalid checksum'
-                    __log__.info(msg)
+                    self._log.info(msg)
                 else:
                     msg = 'Unexpected exception in the receive loop'
-                    __log__.exception(msg)
+                    self._log.exception(msg)
 
                 self.disconnect()
 
@@ -176,6 +172,16 @@ class Connection(abc.ABC):
                 await self._recv_queue.put(data)
             except asyncio.CancelledError:
                 break
+
+    def _init_conn(self):
+        """
+        This method will be called after `connect` is called.
+        After this method finishes, the writer will be drained.
+
+        Subclasses should make use of this if they need to send
+        data to Telegram to indicate which connection mode will
+        be used.
+        """
 
     @abc.abstractmethod
     def _send(self, data):

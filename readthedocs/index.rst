@@ -19,6 +19,7 @@ when you upgrade!
     * Are you new here? Jump straight into :ref:`getting-started`!
     * Looking for available friendly methods? See :ref:`telethon-client`.
     * Used Telethon before v1.0? See :ref:`compatibility-and-convenience`.
+    * Need the full API reference? https://lonamiwebs.github.io/Telethon/.
 
 
 What is this?
@@ -68,7 +69,6 @@ heavy job for you, so you can focus on developing an application.
    extra/examples/working-with-messages
    extra/examples/chats-and-channels
    extra/examples/users
-   extra/examples/bots
    extra/examples/projects-using-telethon
 
 

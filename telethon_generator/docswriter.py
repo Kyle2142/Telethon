@@ -3,25 +3,25 @@ import re
 
 
 class DocsWriter:
-    """Utility class used to write the HTML files used on the documentation"""
-    def __init__(self, filename, type_to_path):
-        """Initializes the writer to the specified output file,
-           creating the parent directories when used if required.
-
-           'type_to_path_function' should be a function which, given a type
-           name and a named argument relative_to, returns the file path for
-           the specified type, relative to the given filename
+    """
+    Utility class used to write the HTML files used on the documentation.
+    """
+    def __init__(self, root, filename, type_to_path):
         """
+        Initializes the writer to the specified output file,
+        creating the parent directories when used if required.
+        """
+        self.root = root
         self.filename = filename
+        self._parent = str(self.filename.parent)
         self.handle = None
+        self.title = ''
 
         # Should be set before calling adding items to the menu
         self.menu_separator_tag = None
 
-        # Utility functions TODO There must be a better way
-        self.type_to_path = lambda t: type_to_path(
-            t, relative_to=self.filename
-        )
+        # Utility functions
+        self.type_to_path = lambda t: self._rel(type_to_path(t))
 
         # Control signals
         self.menu_began = False
@@ -30,11 +30,21 @@ class DocsWriter:
         self.write_copy_script = False
         self._script = ''
 
+    def _rel(self, path):
+        """
+        Get the relative path for the given path from the current
+        file by working around https://bugs.python.org/issue20012.
+        """
+        return os.path.relpath(
+            str(path), self._parent).replace(os.path.sep, '/')
+
     # High level writing
-    def write_head(self, title, relative_css_path, default_css):
+    def write_head(self, title, css_path, default_css):
         """Writes the head part for the generated document,
            with the given title and CSS
         """
+        #
+        self.title = title
         self.write(
             '''<!DOCTYPE html>
 <html>
@@ -42,7 +52,7 @@ class DocsWriter:
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
     <title>{title}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link id="style" href="{rel_css}/docs.{def_css}.css" rel="stylesheet">
+    <link id="style" href="{rel_css}/docs.dark.css" rel="stylesheet">
     <script>
     document.getElementById("style").href = "{rel_css}/docs."
         + (localStorage.getItem("theme") || "{def_css}")
@@ -54,17 +64,17 @@ class DocsWriter:
 <body>
 <div id="main_div">''',
             title=title,
-            rel_css=relative_css_path.rstrip('/'),
+            rel_css=self._rel(css_path),
             def_css=default_css
         )
 
-    def set_menu_separator(self, relative_image_path):
+    def set_menu_separator(self, img):
         """Sets the menu separator.
            Must be called before adding entries to the menu
         """
-        if relative_image_path:
-            self.menu_separator_tag = \
-                '<img src="{}" alt="/" />'.format(relative_image_path)
+        if img:
+            self.menu_separator_tag = '<img src="{}" alt="/" />'.format(
+                self._rel(img))
         else:
             self.menu_separator_tag = None
 
@@ -80,7 +90,7 @@ class DocsWriter:
 
         self.write('<li>')
         if link:
-            self.write('<a href="{}">', link)
+            self.write('<a href="{}">', self._rel(link))
 
         # Write the real menu entry text
         self.write(name)
@@ -210,7 +220,7 @@ class DocsWriter:
         if bold:
             self.write('<b>')
         if link:
-            self.write('<a href="{}">', link)
+            self.write('<a href="{}">', self._rel(link))
 
         # Finally write the real table data, the given text
         self.write(text)
@@ -244,9 +254,10 @@ class DocsWriter:
         self.write('<button onclick="cp(\'{}\');">{}</button>'
                    .format(text_to_copy, text))
 
-    def add_script(self, src='', relative_src=None):
-        if relative_src:
-            self._script += '<script src="{}"></script>'.format(relative_src)
+    def add_script(self, src='', path=None):
+        if path:
+            self._script += '<script src="{}"></script>'.format(
+                self._rel(path))
         elif src:
             self._script += '<script>{}</script>'.format(src)
 
@@ -278,11 +289,8 @@ class DocsWriter:
     # With block
     def __enter__(self):
         # Sanity check
-        parent = os.path.dirname(self.filename)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        self.handle = open(self.filename, 'w', encoding='utf-8')
+        self.filename.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.filename.open('w', encoding='utf-8')
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

@@ -93,81 +93,6 @@ channel, you can use the :tl:`CheckChatInviteRequest`, which takes in
 the hash of said channel or group.
 
 
-Retrieving all chat members (channels too)
-******************************************
-
-.. note::
-
-    Use the `telethon.telegram_client.TelegramClient.iter_participants`
-    friendly method instead unless you have a better reason not to!
-
-    This method will handle different chat types for you automatically.
-
-
-Here is the easy way to do it:
-
-.. code-block:: python
-
-    participants = client.get_participants(group)
-
-Now we will show how the method works internally.
-
-In order to get all the members from a mega-group or channel, you need
-to use :tl:`GetParticipantsRequest`. As we can see it needs an
-:tl:`InputChannel`, (passing the mega-group or channel you're going to
-use will work), and a mandatory :tl:`ChannelParticipantsFilter`. The
-closest thing to "no filter" is to simply use
-:tl:`ChannelParticipantsSearch` with an empty ``'q'`` string.
-
-If we want to get *all* the members, we need to use a moving offset and
-a fixed limit:
-
-.. code-block:: python
-
-    from telethon.tl.functions.channels import GetParticipantsRequest
-    from telethon.tl.types import ChannelParticipantsSearch
-    from time import sleep
-
-    offset = 0
-    limit = 100
-    all_participants = []
-
-    while True:
-        participants = client(GetParticipantsRequest(
-            channel, ChannelParticipantsSearch(''), offset, limit, hash=0
-        ))
-        if not participants.users:
-            break
-        all_participants.extend(participants.users)
-        offset += len(participants.users)
-
-
-.. note::
-
-    If you need more than 10,000 members from a group you should use the
-    mentioned ``client.get_participants(..., aggressive=True)``. It will
-    do some tricks behind the scenes to get as many entities as possible.
-    Refer to `issue 573`__ for more on this.
-
-
-Note that :tl:`GetParticipantsRequest` returns :tl:`ChannelParticipants`,
-which may have more information you need (like the role of the
-participants, total count of members, etc.)
-
-__ https://github.com/LonamiWebs/Telethon/issues/573
-
-
-Recent Actions
-**************
-
-"Recent actions" is simply the name official applications have given to
-the "admin log". Simply use :tl:`GetAdminLogRequest` for that, and
-you'll get AdminLogResults.events in return which in turn has the final
-`.action`__.
-
-__ https://lonamiwebs.github.io/Telethon/types/channel_admin_log_event_action.html
-
-
 Admin Permissions
 *****************
 
@@ -176,14 +101,14 @@ Giving or revoking admin permissions can be done with the :tl:`EditAdminRequest`
 .. code-block:: python
 
     from telethon.tl.functions.channels import EditAdminRequest
-    from telethon.tl.types import ChannelAdminRights
+    from telethon.tl.types import ChatAdminRights
 
     # You need both the channel and who to grant permissions
     # They can either be channel/user or input channel/input user.
     #
-    # ChannelAdminRights is a list of granted permissions.
+    # ChatAdminRights is a list of granted permissions.
     # Set to True those you want to give.
-    rights = ChannelAdminRights(
+    rights = ChatAdminRights(
         post_messages=None,
         add_admins=None,
         invite_users=None,
@@ -195,17 +120,23 @@ Giving or revoking admin permissions can be done with the :tl:`EditAdminRequest`
         edit_messages=None
     )
     # Equivalent to:
-    #     rights = ChannelAdminRights(
+    #     rights = ChatAdminRights(
     #         change_info=True,
     #         delete_messages=True,
     #         pin_messages=True
     #     )
 
-    # Once you have a ChannelAdminRights, invoke it
+    # Once you have a ChatAdminRights, invoke it
     client(EditAdminRequest(channel, user, rights))
 
     # User will now be able to change group info, delete other people's
     # messages and pin messages.
+    #
+    # In a normal chat, you should do this instead:
+    from telethon.tl.functions.messages import EditChatAdminRequest
+
+    client(EditChatAdminRequest(chat_id, user, is_admin=True))
+
 
 
 .. note::
@@ -225,12 +156,12 @@ Restricting Users
 
 Similar to how you give or revoke admin permissions, you can edit the
 banned rights of a user through :tl:`EditBannedRequest` and its parameter
-:tl:`ChannelBannedRights`:
+:tl:`ChatBannedRights`:
 
 .. code-block:: python
 
     from telethon.tl.functions.channels import EditBannedRequest
-    from telethon.tl.types import ChannelBannedRights
+    from telethon.tl.types import ChatBannedRights
 
     from datetime import datetime, timedelta
 
@@ -238,7 +169,7 @@ banned rights of a user through :tl:`EditBannedRequest` and its parameter
     #
     # Note that it's "reversed". You must set to ``True`` the permissions
     # you want to REMOVE, and leave as ``None`` those you want to KEEP.
-    rights = ChannelBannedRights(
+    rights = ChatBannedRights(
         until_date=timedelta(days=7),
         view_messages=None,
         send_messages=None,
@@ -251,7 +182,7 @@ banned rights of a user through :tl:`EditBannedRequest` and its parameter
     )
 
     # The above is equivalent to
-    rights = ChannelBannedRights(
+    rights = ChatBannedRights(
         until_date=datetime.now() + timedelta(days=7),
         send_media=True,
         send_stickers=True,
@@ -281,10 +212,10 @@ is enough:
 .. code-block:: python
 
     from telethon.tl.functions.channels import EditBannedRequest
-    from telethon.tl.types import ChannelBannedRights
+    from telethon.tl.types import ChatBannedRights
 
     client(EditBannedRequest(
-        channel, user, ChannelBannedRights(
+        channel, user, ChatBannedRights(
             until_date=None,
             view_messages=True
         )

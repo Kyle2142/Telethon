@@ -57,10 +57,16 @@ def parse_errors(csv_file):
     Parses the input CSV file with columns (name, error codes, description)
     and yields `Error` instances as a result.
     """
-    with open(csv_file, newline='') as f:
+    with csv_file.open(newline='') as f:
         f = csv.reader(f)
         next(f, None)  # header
-        for line, (name, codes, description) in enumerate(f, start=2):
+        for line, tup in enumerate(f, start=2):
+            try:
+                name, codes, description = tup
+            except ValueError:
+                raise ValueError('Columns count mismatch, unquoted comma in '
+                                 'desc? (line {})'.format(line)) from None
+
             try:
                 codes = [int(x) for x in codes.split()] or [400]
             except ValueError:

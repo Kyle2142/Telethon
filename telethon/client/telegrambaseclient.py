@@ -4,12 +4,12 @@ import logging
 import platform
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
-from .. import version
+from .. import version, __name__ as __base_name__
 from ..crypto import rsa
 from ..extensions import markdown
-from ..network import MTProtoSender, ConnectionTcpFull
+from ..network import MTProtoSender, ConnectionTcpFull, ConnectionTcpMTProxy
 from ..sessions import Session, SQLiteSession, MemorySession
 from ..tl import TLObject, functions, types
 from ..tl.alltlobjects import LAYER
@@ -19,7 +19,8 @@ DEFAULT_IPV4_IP = '149.154.167.51'
 DEFAULT_IPV6_IP = '[2001:67c:4e8:f002::a]'
 DEFAULT_PORT = 443
 
-__log__ = logging.getLogger(__name__)
+__default_log__ = logging.getLogger(__base_name__)
+__default_log__.addHandler(logging.NullHandler())
 
 
 class TelegramBaseClient(abc.ABC):
@@ -60,8 +61,11 @@ class TelegramBaseClient(abc.ABC):
             By default this is ``False`` as IPv6 support is not
             too widespread yet.
 
-        proxy (`tuple` | `dict`, optional):
-            A tuple consisting of ``(socks.SOCKS5, 'host', port)``.
+        proxy (`tuple` | `list` | `dict`, optional):
+            An iterable consisting of the proxy info. If `connection` is
+            `ConnectionTcpMTProxy`, then it should contain MTProxy credentials:
+            ``('hostname', port, 'secret')``. Otherwise, it's meant to store
+            function parameters for PySocks, like ``(type, 'hostname', port)``.
             See https://github.com/Anorov/PySocks#usage-1 for more.
 
         timeout (`int` | `float`, optional):
@@ -70,23 +74,23 @@ class TelegramBaseClient(abc.ABC):
             invoked requests, and you should use ``asyncio.wait`` or
             ``asyncio.wait_for`` for that.
 
-        request_retries (`int`, optional):
+        request_retries (`int` | `None`, optional):
             How many times a request should be retried. Request are retried
             when Telegram is having internal issues (due to either
             ``errors.ServerError`` or ``errors.RpcCallFailError``),
             when there is a ``errors.FloodWaitError`` less than
             `flood_sleep_threshold`, or when there's a migrate error.
 
-            May set to a false-y value (``0`` or ``None``) for infinite
-            retries, but this is not recommended, since some requests can
-            always trigger a call fail (such as searching for messages).
+            May take a negative or ``None`` value for infinite retries, but
+            this is not recommended, since some requests can always trigger
+            a call fail (such as searching for messages).
 
-        connection_retries (`int`, optional):
+        connection_retries (`int` | `None`, optional):
             How many times the reconnection should retry, either on the
             initial connection or when Telegram disconnects us. May be
-            set to a false-y value (``0`` or ``None``) for infinite
-            retries, but this is not recommended, since the program can
-            get stuck in an infinite loop.
+            set to a negative or ``None`` value for infinite retries, but
+            this is not recommended, since the program can get stuck in an
+            infinite loop.
 
         retry_delay (`int` | `float`, optional):
             The delay in seconds to sleep between automatic reconnections.
@@ -133,6 +137,15 @@ class TelegramBaseClient(abc.ABC):
         system_lang_code (`str`, optional):
             "System lang code"  to be sent when creating the initial connection.
             Defaults to `lang_code`.
+
+        loop (`asyncio.AbstractEventLoop`, optional):
+            Asyncio event loop to use. Defaults to `asyncio.get_event_loop()`
+
+        base_logger (`str` | `logging.Logger`, optional):
+            Base logger name or instance to use.
+            If a `str` is given, it'll be passed to `logging.getLogger()`. If a
+            `logging.Logger` is given, it'll be used directly. If something
+            else or nothing is given, the default logger will be used.
     """
 
     # Current TelegramClient version
@@ -161,7 +174,8 @@ class TelegramBaseClient(abc.ABC):
                  app_version=None,
                  lang_code='en',
                  system_lang_code='en',
-                 loop=None):
+                 loop=None,
+                 base_logger=None):
         if not api_id or not api_hash:
             raise ValueError(
                 "Your API ID or Hash cannot be empty or None. "
@@ -170,11 +184,25 @@ class TelegramBaseClient(abc.ABC):
         self._use_ipv6 = use_ipv6
         self._loop = loop or asyncio.get_event_loop()
 
+        if isinstance(base_logger, str):
+            base_logger = logging.getLogger(base_logger)
+        elif not isinstance(base_logger, logging.Logger):
+            base_logger = __default_log__
+
+        class _Loggers(dict):
+            def __missing__(self, key):
+                if key.startswith("telethon."):
+                    key = key.split('.', maxsplit=1)[1]
+
+                return base_logger.getChild(key)
+
+        self._log = _Loggers()
+
         # Determine what session object we have
         if isinstance(session, str) or session is None:
             try:
                 session = SQLiteSession(session)
-            except ValueError:
+            except ImportError:
                 import warnings
                 warnings.warn(
                     'The sqlite3 module is not available under this '
@@ -211,8 +239,8 @@ class TelegramBaseClient(abc.ABC):
         self.api_id = int(api_id)
         self.api_hash = api_hash
 
-        self._request_retries = request_retries or sys.maxsize
-        self._connection_retries = connection_retries or sys.maxsize
+        self._request_retries = request_retries
+        self._connection_retries = connection_retries
         self._retry_delay = retry_delay or 0
         self._proxy = proxy
         self._timeout = timeout
@@ -220,6 +248,8 @@ class TelegramBaseClient(abc.ABC):
 
         assert isinstance(connection, type)
         self._connection = connection
+        init_proxy = None if connection is not ConnectionTcpMTProxy else \
+            types.InputClientProxy(*ConnectionTcpMTProxy.address_info(proxy))
 
         # Used on connection. Capture the variables in a lambda since
         # exporting clients need to create this InvokeWithLayerRequest.
@@ -233,13 +263,14 @@ class TelegramBaseClient(abc.ABC):
                 lang_code=lang_code,
                 system_lang_code=system_lang_code,
                 lang_pack='',  # "langPacks are for official apps only"
-                query=x
+                query=x,
+                proxy=init_proxy
             )
         )
 
-        self._connection = connection
         self._sender = MTProtoSender(
             self.session.auth_key, self._loop,
+            loggers=self._log,
             retries=self._connection_retries,
             delay=self._retry_delay,
             auto_reconnect=self._auto_reconnect,
@@ -270,8 +301,10 @@ class TelegramBaseClient(abc.ABC):
             self._dispatching_updates_queue = None
 
         self._authorized = None  # None = unknown, False = no, True = yes
-        self._state = (self.session.get_update_state(0)
-                       or types.updates.State(0, 0, datetime.now(), 0, 0))
+        self._state = self.session.get_update_state(0)
+        if not self._state:
+            self._state = types.updates.State(
+                0, 0, datetime.now(tz=timezone.utc), 0, 0)
 
         # Some further state for subclasses
         self._event_builders = []
@@ -289,6 +322,7 @@ class TelegramBaseClient(abc.ABC):
 
         # Sometimes we need to know who we are, cache the self peer
         self._self_input_peer = None
+        self._bot = None
 
     # endregion
 
@@ -315,8 +349,12 @@ class TelegramBaseClient(abc.ABC):
         Connects to Telegram.
         """
         await self._sender.connect(self._connection(
-            self.session.server_address, self.session.port,
-            loop=self._loop, proxy=self._proxy
+            self.session.server_address,
+            self.session.port,
+            self.session.dc_id,
+            loop=self._loop,
+            loggers=self._log,
+            proxy=self._proxy
         ))
         self.session.auth_key = self._sender.auth_key
         self.session.save()
@@ -374,13 +412,19 @@ class TelegramBaseClient(abc.ABC):
         # able to close the pending tasks properly, and letting the script
         # complete without calling disconnect causes the script to trigger
         # 100% CPU load. Call disconnect to make sure it doesn't happen.
-        self.disconnect()
+        try:
+            self.disconnect()
+        except Exception:
+            # Arguably not the best solution, but worth trying if the user
+            # forgot to disconnect; normally this is fine but sometimes it
+            # can fail (https://github.com/LonamiWebs/Telethon/issues/1073)
+            pass
 
     async def _switch_dc(self, new_dc):
         """
         Permanently switches the current connection to the new data center.
         """
-        __log__.info('Reconnecting to new data center %s', new_dc)
+        self._log[__name__].info('Reconnecting to new data center %s', new_dc)
         dc = await self._get_dc(new_dc)
 
         self.session.set_dc(dc.id, dc.ip_address, dc.port)
@@ -433,10 +477,17 @@ class TelegramBaseClient(abc.ABC):
         #
         # If one were to do that, Telegram would reset the connection
         # with no further clues.
-        sender = MTProtoSender(None, self._loop)
+        sender = MTProtoSender(None, self._loop, loggers=self._log)
         await sender.connect(self._connection(
-            dc.ip_address, dc.port, loop=self._loop, proxy=self._proxy))
-        __log__.info('Exporting authorization for data center %s', dc)
+            dc.ip_address,
+            dc.port,
+            dc.id,
+            loop=self._loop,
+            loggers=self._log,
+            proxy=self._proxy
+        ))
+        self._log[__name__].info('Exporting authorization for data center %s',
+                                 dc)
         auth = await self(functions.auth.ExportAuthorizationRequest(dc_id))
         req = self._init_with(functions.auth.ImportAuthorizationRequest(
             id=auth.id, bytes=auth.bytes
@@ -460,8 +511,12 @@ class TelegramBaseClient(abc.ABC):
             elif not n:
                 dc = await self._get_dc(dc_id)
                 await sender.connect(self._connection(
-                    dc.ip_address, dc.port,
-                    loop=self._loop, proxy=self._proxy
+                    dc.ip_address,
+                    dc.port,
+                    dc.id,
+                    loop=self._loop,
+                    loggers=self._log,
+                    proxy=self._proxy
                 ))
 
             self._borrowed_senders[dc_id] = (n + 1, sender)
@@ -479,7 +534,8 @@ class TelegramBaseClient(abc.ABC):
             n -= 1
             self._borrowed_senders[dc_id] = (n, sender)
             if not n:
-                __log__.info('Disconnecting borrowed sender for DC %d', dc_id)
+                self._log[__name__].info(
+                    'Disconnecting borrowed sender for DC %d', dc_id)
                 sender.disconnect()
 
     async def _get_cdn_client(self, cdn_redirect):
@@ -493,7 +549,7 @@ class TelegramBaseClient(abc.ABC):
             await session.set_dc(dc.id, dc.ip_address, dc.port)
             self._exported_sessions[cdn_redirect.dc_id] = session
 
-        __log__.info('Creating new CDN client')
+        self._log[__name__].info('Creating new CDN client')
         client = TelegramBareClient(
             session, self.api_id, self.api_hash,
             proxy=self._sender.connection.conn.proxy,

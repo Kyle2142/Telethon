@@ -262,6 +262,36 @@ Or just some IDs:
     message_1337 = client.get_messages(chats, ids=1337)
 
 
+Exporting Messages
+******************
+
+If you plan on exporting data from your Telegram account, such as the entire
+message history from your private conversations, chats or channels, or if you
+plan to download a lot of media, you may prefer to do this within a *takeout*
+session. Takeout sessions let you export data from your account with lower
+flood wait limits.
+
+To start a takeout session, simply call `client.takeout()
+<telethon.client.account.AccountMethods.takeout>`:
+
+.. code-block:: python
+
+    from telethon import errors
+
+    try:
+        with client.takeout() as takeout:
+            for message in takeout.iter_messages(chat, wait_time=0):
+                ...  # Do something with the message
+
+    except errors.TakeoutInitDelayError as e:
+        print('Must wait', e.seconds, 'before takeout')
+
+
+Depending on the condition of the session (for example, when it's very
+young and the method has not been called before), you may or not need
+to ``except errors.TakeoutInitDelayError``. However, it is good practice.
+
+
 Sending Messages
 ****************
 
@@ -363,6 +393,57 @@ You can send albums if you pass more than one file:
 
 The caption can also be a list to match the different photos.
 
+Reusing Uploaded Files
+**********************
+
+All files you send are automatically cached, so if you do:
+
+.. code-block:: python
+
+    client.send_file(first_chat, 'document.txt')
+    client.send_file(second_chat, 'document.txt')
+
+The ``'document.txt'`` file will only be uploaded once. You
+can disable this behaviour by settings ``allow_cache=False``:
+
+.. code-block:: python
+
+    client.send_file(first_chat, 'document.txt', allow_cache=False)
+    client.send_file(second_chat, 'document.txt', allow_cache=False)
+
+Disabling cache is the only way to send the same document with different
+attributes (for example, you send an ``.ogg`` as a song but now you want
+it to show as a voice note; you probably need to disable the cache).
+
+However, you can *upload* the file once (not sending it yet!), and *then*
+you can send it with different attributes. This means you can send an image
+as a photo and a document:
+
+.. code-block:: python
+
+    file = client.upload_file('photo.jpg')
+    client.send_file(chat, file)                       # sends as photo
+    client.send_file(chat, file, force_document=True)  # sends as document
+
+    file.name = 'not a photo.jpg'
+    client.send_file(chat, file, force_document=True)  # document, new name
+
+Or, the example described before:
+
+.. code-block:: python
+
+    file = client.upload_file('song.ogg')
+    client.send_file(chat, file)                   # sends as song
+    client.send_file(chat, file, voice_note=True)  # sends as voice note
+
+The ``file`` returned by `client.upload_file
+<telethon.client.uploads.UploadMethods.upload_file>` represents the uploaded
+file, not an immutable document (that's why the attributes can change, because
+they are set later). This handle can be used only for a limited amount of time
+(somewhere within a day). Telegram decides this limit and it is not public.
+However, a day is often more than enough.
+
+
 Sending Messages with Buttons
 *****************************
 
@@ -402,7 +483,7 @@ location, phone number, or simply for them to easily send a message:
 .. code-block:: python
 
     client.send_message(chat, 'Welcome', buttons=[
-        Button.text('Thanks!'),
+        Button.text('Thanks!', resize=True, single_use=True),
         Button.request_phone('Send phone'),
         Button.request_location('Send location')
     ])
@@ -644,3 +725,36 @@ Note that the utils package also has a `get_peer_id
 <telethon.utils.get_peer_id>` but it won't work with things
 that need access to the network such as usernames or phones,
 which need to be in your contact list.
+
+Getting the Admin Log
+*********************
+
+If you're an administrator in a channel or megagroup, then you have access
+to the admin log. This is a list of events within the last 48 hours of
+different actions, such as joining or leaving members, edited or deleted
+messages, new promotions, bans or restrictions.
+
+You can iterate over all the available actions like so:
+
+.. code-block:: python
+
+    for event in client.iter_admin_log(channel):
+        if event.changed_title:
+            print('The title changed from', event.old, 'to', event.new)
+
+You can also filter to only show some text or actions.
+Let's find people who swear to ban them:
+
+.. code-block:: python
+
+    # Get a list of deleted message events which said "heck"
+    events = client.get_admin_log(channel, search='heck', delete=True)
+
+    # Print the old message before it was deleted
+    print(events[0].old)
+
+You can find here the documentation for `client.iter_admin_log
+<telethon.client.chats.ChatMethods.iter_admin_log>`, and be sure
+to also check the properties of the returned `AdminLogEvent
+<telethon.tl.custom.adminlogevent.AdminLogEvent>` to know what
+you can access.

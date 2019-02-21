@@ -4,6 +4,9 @@ to convert between an entity like a User, Chat, etc. into its Input version)
 """
 import base64
 import binascii
+import imghdr
+import inspect
+import io
 import itertools
 import math
 import mimetypes
@@ -16,7 +19,6 @@ from types import GeneratorType
 from .extensions import markdown, html
 from .helpers import add_surrogate, del_surrogate
 from .tl import types
-import inspect
 
 try:
     import hachoir
@@ -25,10 +27,26 @@ try:
 except ImportError:
     hachoir = None
 
-# .webp (stickers) and .ogg (some voice notes) mimetypes are unknown on some
-# operative systems. Manually register them here to make them work everywhere.
+# Register some of the most common mime-types to avoid any issues.
+# See https://github.com/LonamiWebs/Telethon/issues/1096.
+mimetypes.add_type('image/png', '.png')
+mimetypes.add_type('image/jpeg', '.jpeg')
 mimetypes.add_type('image/webp', '.webp')
+mimetypes.add_type('image/gif', '.gif')
+mimetypes.add_type('image/bmp', '.bmp')
+mimetypes.add_type('image/x-tga', '.tga')
+mimetypes.add_type('image/tiff', '.tiff')
+mimetypes.add_type('image/vnd.adobe.photoshop', '.psd')
+
+mimetypes.add_type('video/mp4', '.mp4')
+mimetypes.add_type('video/quicktime', '.mov')
+mimetypes.add_type('video/avi', '.avi')
+
+mimetypes.add_type('audio/mp3', '.mp3')
+mimetypes.add_type('audio/m4a', '.m4a')
+mimetypes.add_type('audio/aac', '.aac')
 mimetypes.add_type('audio/ogg', '.ogg')
+mimetypes.add_type('audio/flac', '.flac')
 
 USERNAME_RE = re.compile(
     r'@|(?:https?://)?(?:www\.)?(?:telegram\.(?:me|dog)|t\.me)/(joinchat/)?'
@@ -114,6 +132,10 @@ def get_input_peer(entity, allow_self=True, check_hash=True):
 
     A ``TypeError`` is raised if the given entity isn't a supported type
     or if ``check_hash is True`` but the entity's ``access_hash is None``.
+
+    Note that ``check_hash`` **is ignored** if an input peer is already
+    passed since in that case we assume the user knows what they're doing.
+    This is key to getting entities by explicitly passing ``hash = 0``.
     """
     try:
         if entity.SUBCLASS_OF_ID == 0xc91c90b6:  # crc32(b'InputPeer')
@@ -242,7 +264,8 @@ def get_input_document(document):
 
     if isinstance(document, types.Document):
         return types.InputDocument(
-            id=document.id, access_hash=document.access_hash)
+            id=document.id, access_hash=document.access_hash,
+            file_reference=document.file_reference)
 
     if isinstance(document, types.DocumentEmpty):
         return types.InputDocumentEmpty()
@@ -332,12 +355,17 @@ def get_input_geo(geo):
     _raise_cast_fail(geo, 'InputGeoPoint')
 
 
-def get_input_media(media, is_photo=False):
+def get_input_media(
+        media, *,
+        is_photo=False, attributes=None, force_document=False,
+        voice_note=False, video_note=False, supports_streaming=False
+):
     """
     Similar to :meth:`get_input_peer`, but for media.
 
-    If the media is a file location and ``is_photo`` is known to be ``True``,
-    it will be treated as an :tl:`InputMediaUploadedPhoto`.
+    If the media is :tl:`InputFile` and ``is_photo`` is known to be ``True``,
+    it will be treated as an :tl:`InputMediaUploadedPhoto`. Else, the rest
+    of parameters will indicate how to treat it.
     """
     try:
         if media.SUBCLASS_OF_ID == 0xfaf846f4:  # crc32(b'InputMedia')
@@ -371,15 +399,20 @@ def get_input_media(media, is_photo=False):
             id=get_input_document(media)
         )
 
-    if isinstance(media, types.FileLocation):
+    if isinstance(media, (types.InputFile, types.InputFileBig)):
         if is_photo:
             return types.InputMediaUploadedPhoto(file=media)
         else:
-            return types.InputMediaUploadedDocument(
-                file=media,
-                mime_type='application/octet-stream',  # unknown, assume bytes
-                attributes=[types.DocumentAttributeFilename('unnamed')]
+            attrs, mime = get_attributes(
+                media,
+                attributes=attributes,
+                force_document=force_document,
+                voice_note=voice_note,
+                video_note=video_note,
+                supports_streaming=supports_streaming
             )
+            return types.InputMediaUploadedDocument(
+                file=media, mime_type=mime, attributes=attrs)
 
     if isinstance(media, types.MessageMediaGame):
         return types.InputMediaGame(id=media.game.id)
@@ -458,11 +491,13 @@ def get_message_id(message):
 
 
 def get_attributes(file, *, attributes=None, mime_type=None,
-                   force_document=False, voice_note=False, video_note=False):
+                   force_document=False, voice_note=False, video_note=False,
+                   supports_streaming=False):
     """
     Get a list of attributes for the given file and
     the mime type as a tuple ([attribute], mime_type).
     """
+    # Note: ``file.name`` works for :tl:`InputFile` and some `IOBase` streams
     name = file if isinstance(file, str) else getattr(file, 'name', 'unnamed')
     if mime_type is None:
         mime_type = mimetypes.guess_type(name)[0]
@@ -491,11 +526,13 @@ def get_attributes(file, *, attributes=None, mime_type=None,
                     w=m.get('width') if m.has('width') else 0,
                     h=m.get('height') if m.has('height') else 0,
                     duration=int(m.get('duration').seconds
-                                 if m.has('duration') else 0)
+                                 if m.has('duration') else 0),
+                    supports_streaming=supports_streaming
                 )
         else:
             doc = types.DocumentAttributeVideo(
-                0, 1, 1, round_message=video_note)
+                0, 1, 1, round_message=video_note,
+                supports_streaming=supports_streaming)
 
         attr_dict[types.DocumentAttributeVideo] = doc
 
@@ -608,7 +645,14 @@ def _get_extension(file):
     """
     if isinstance(file, str):
         return os.path.splitext(file)[-1]
+    elif isinstance(file, bytes):
+        kind = imghdr.what(io.BytesIO(file))
+        return ('.' + kind) if kind else ''
+    elif isinstance(file, io.IOBase) and file.seekable():
+        kind = imghdr.what(file) is not None
+        return ('.' + kind) if kind else ''
     elif getattr(file, 'name', None):
+        # Note: ``file.name`` works for :tl:`InputFile` and some `IOBase`
         return _get_extension(file.name)
     else:
         return ''
@@ -707,7 +751,10 @@ def get_inner_text(text, entities):
 
 def get_peer(peer):
     try:
-        if peer.SUBCLASS_OF_ID == 0x2d45687:
+        if isinstance(peer, int):
+            pid, cls = resolve_id(peer)
+            return cls(pid)
+        elif peer.SUBCLASS_OF_ID == 0x2d45687:
             return peer
         elif isinstance(peer, (
                 types.contacts.ResolvedPeer, types.InputNotifyPeer,
@@ -715,6 +762,10 @@ def get_peer(peer):
             return peer.peer
         elif isinstance(peer, types.ChannelFull):
             return types.PeerChannel(peer.id)
+
+        if peer.SUBCLASS_OF_ID in (0x7d7c6f86, 0xd9c7fc18):
+            # ChatParticipant, ChannelParticipant
+            return types.PeerUser(peer.user_id)
 
         peer = get_input_peer(peer, allow_self=False, check_hash=False)
         if isinstance(peer, types.InputPeerUser):
@@ -866,6 +917,16 @@ def resolve_bot_file_id(file_id):
     data = data[:-1]
     if len(data) == 24:
         file_type, dc_id, media_id, access_hash = struct.unpack('<iiqq', data)
+
+        if not (1 <= dc_id <= 5):
+            # Valid `file_id`'s must have valid DC IDs. Since this method is
+            # called when sending a file and the user may have entered a path
+            # they believe is correct but the file doesn't exist, this method
+            # may detect a path as "valid" bot `file_id` even when it's not.
+            # By checking the `dc_id`, we greatly reduce the chances of this
+            # happening.
+            return None
+
         attributes = []
         if file_type == 3 or file_type == 9:
             attributes.append(types.DocumentAttributeAudio(
@@ -894,7 +955,7 @@ def resolve_bot_file_id(file_id):
             date=None,
             mime_type='',
             size=0,
-            thumb=types.PhotoSizeEmpty('s'),
+            thumbs=None,
             dc_id=dc_id,
             attributes=attributes,
             file_reference=b''
@@ -903,6 +964,9 @@ def resolve_bot_file_id(file_id):
         (file_type, dc_id, media_id, access_hash,
             volume_id, secret, local_id) = struct.unpack('<iiqqqqi', data)
 
+        if not (1 <= dc_id <= 5):
+            return None
+
         # Thumbnails (small) always have ID 0; otherwise size 'x'
         photo_size = 's' if media_id or access_hash else 'x'
         return types.Photo(id=media_id, access_hash=access_hash, sizes=[
@@ -910,9 +974,10 @@ def resolve_bot_file_id(file_id):
                 dc_id=dc_id,
                 volume_id=volume_id,
                 secret=secret,
-                local_id=local_id
+                local_id=local_id,
+                file_reference=b''
             ), w=0, h=0, size=0)
-        ], date=None)
+        ], file_reference=b'', date=None)
 
 
 def pack_bot_file_id(file):
@@ -924,6 +989,11 @@ def pack_bot_file_id(file):
 
     If an invalid parameter is given, it will ``return None``.
     """
+    if isinstance(file, types.MessageMediaDocument):
+        file = file.document
+    elif isinstance(file, types.MessageMediaPhoto):
+        file = file.photo
+
     if isinstance(file, types.Document):
         file_type = 5
         for attribute in file.attributes:

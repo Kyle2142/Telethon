@@ -72,6 +72,19 @@ def strip_text(text, entities):
     return text
 
 
+def retry_range(retries):
+    """
+    Generates an integer sequence starting from 1. If `retries` is
+    not a zero or a positive integer value, the sequence will be
+    infinite, otherwise it will end at `retries + 1`.
+    """
+    yield 1
+    attempt = 0
+    while attempt != retries:
+        attempt += 1
+        yield 1 + attempt
+
+
 # endregion
 
 # region Cryptographic related utils
@@ -89,20 +102,6 @@ def generate_key_data_from_nonce(server_nonce, new_nonce):
     iv = hash2[12:20] + hash3 + new_nonce[:4]
     return key, iv
 
-
-def get_password_hash(pw, current_salt):
-    """Gets the password hash for the two-step verification.
-       current_salt should be the byte array provided by
-       invoking GetPasswordRequest()
-    """
-
-    # Passwords are encoded as UTF-8
-    # At https://github.com/DrKLO/Telegram/blob/e31388
-    # src/main/java/org/telegram/ui/LoginActivity.java#L2003
-    data = pw.encode('utf-8')
-
-    pw_hash = current_salt + data + current_salt
-    return sha256(pw_hash).digest()
 
 # endregion
 

@@ -14,11 +14,13 @@ from ..tl.types import (
 
 try:
     import sqlite3
-except ImportError:
+    sqlite3_err = None
+except ImportError as e:
     sqlite3 = None
+    sqlite3_err = type(e)
 
 EXTENSION = '.session'
-CURRENT_VERSION = 4  # database version
+CURRENT_VERSION = 5  # database version
 
 
 class SQLiteSession(MemorySession):
@@ -32,7 +34,7 @@ class SQLiteSession(MemorySession):
 
     def __init__(self, session_id=None):
         if sqlite3 is None:
-            raise ValueError('sqlite3 is not installed')
+            raise sqlite3_err
 
         super().__init__()
         self.filename = ':memory:'
@@ -65,7 +67,8 @@ class SQLiteSession(MemorySession):
             c.execute('select * from sessions')
             tuple_ = c.fetchone()
             if tuple_:
-                self._dc_id, self._server_address, self._port, key, = tuple_
+                self._dc_id, self._server_address, self._port, key, \
+                    self._takeout_id = tuple_
                 self._auth_key = AuthKey(data=key)
 
             c.close()
@@ -79,7 +82,8 @@ class SQLiteSession(MemorySession):
                     dc_id integer primary key,
                     server_address text,
                     port integer,
-                    auth_key blob
+                    auth_key blob,
+                    takeout_id integer
                 )"""
                 ,
                 """entities (
@@ -172,6 +176,9 @@ class SQLiteSession(MemorySession):
                 date integer,
                 seq integer
             )""")
+        if old == 4:
+            old += 1
+            c.execute("alter table sessions add column takeout_id integer")
         c.close()
 
     @staticmethod
@@ -197,6 +204,11 @@ class SQLiteSession(MemorySession):
         self._auth_key = value
         self._update_session_table()
 
+    @MemorySession.takeout_id.setter
+    def takeout_id(self, value):
+        self._takeout_id = value
+        self._update_session_table()
+
     def _update_session_table(self):
         c = self._cursor()
         # While we can save multiple rows into the sessions table
@@ -205,11 +217,12 @@ class SQLiteSession(MemorySession):
         # some more work before being able to save auth_key's for
         # multiple DCs. Probably done differently.
         c.execute('delete from sessions')
-        c.execute('insert or replace into sessions values (?,?,?,?)', (
+        c.execute('insert or replace into sessions values (?,?,?,?,?)', (
             self._dc_id,
             self._server_address,
             self._port,
-            self._auth_key.key if self._auth_key else b''
+            self._auth_key.key if self._auth_key else b'',
+            self._takeout_id
         ))
         c.close()
 
