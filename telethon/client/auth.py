@@ -375,12 +375,6 @@ class AuthMethods(MessageParseMethods, UserMethods):
         self._self_input_peer = utils.get_input_peer(user, allow_self=False)
         self._authorized = True
 
-        # By setting state.pts = 1 after logging in, the user or bot can
-        # `catch_up` on all updates (and obtain necessary access hashes)
-        # if they desire. The date parameter is ignored when pts = 1.
-        self._state.pts = 1
-        self._state.date = datetime.datetime.now(tz=datetime.timezone.utc)
-
         return user
 
     async def send_code_request(self, phone, *, force_sms=False):
@@ -437,10 +431,9 @@ class AuthMethods(MessageParseMethods, UserMethods):
         self._bot = None
         self._self_input_peer = None
         self._authorized = False
-        self._state = types.updates.State(
-            0, 0, datetime.datetime.now(tz=datetime.timezone.utc), 0, 0)
+        self._state_cache.reset()
 
-        self.disconnect()
+        await self.disconnect()
         self.session.delete()
         return True
 
@@ -537,22 +530,13 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
     # region with blocks
 
-    def __enter__(self):
-        if self._loop.is_running():
-            raise RuntimeError(
-                'You must use "async with" if the event loop '
-                'is running (i.e. you are inside an "async def")'
-            )
-
-        return self.start()
-
     async def __aenter__(self):
         return await self.start()
 
-    def __exit__(self, *args):
-        self.disconnect()
-
     async def __aexit__(self, *args):
-        self.disconnect()
+        await self.disconnect()
+
+    __enter__ = helpers._sync_enter
+    __exit__ = helpers._sync_exit
 
     # endregion

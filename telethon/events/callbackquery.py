@@ -60,6 +60,7 @@ class CallbackQuery(EventBuilder):
         return event
 
     def filter(self, event):
+        # We can't call super().filter(...) because it ignores chat_instance
         if self.chats is not None:
             inside = event.query.chat_instance in self.chats
             if event.chat_id:
@@ -76,7 +77,8 @@ class CallbackQuery(EventBuilder):
             elif event.query.data != self.data:
                 return None
 
-        return event
+        if not self.func or self.func(event):
+            return event
 
     class Event(EventCommon, SenderGetter):
         """
@@ -100,6 +102,11 @@ class CallbackQuery(EventBuilder):
             self._sender = None
             self._message = None
             self._answered = False
+
+        def _set_client(self, client):
+            super()._set_client(client)
+            self._sender, self._input_sender = utils._get_entity_pair(
+                self.sender_id, self._entities, client._entity_cache)
 
         @property
         def id(self):
@@ -156,10 +163,8 @@ class CallbackQuery(EventBuilder):
             if not getattr(self._input_sender, 'access_hash', True):
                 # getattr with True to handle the InputPeerSelf() case
                 try:
-                    self._input_sender = self._client.session.get_input_entity(
-                        self._sender_id
-                    )
-                except ValueError:
+                    self._input_sender = self._client._entity_cache[self._sender_id]
+                except KeyError:
                     m = await self.get_message()
                     if m:
                         self._sender = m._sender
@@ -201,6 +206,21 @@ class CallbackQuery(EventBuilder):
                 )
             )
 
+        @property
+        def via_inline(self):
+            """
+            Whether this callback was generated from an inline button sent
+            via an inline query or not. If the bot sent the message itself
+            with buttons, and one of those is clicked, this will be ``False``.
+            If a user sent the message coming from an inline query to the
+            bot, and one of those is clicked, this will be ``True``.
+
+            If it's ``True``, it's likely that the bot is **not** in the
+            chat, so methods like `respond` or `delete` won't work (but
+            `edit` will always work).
+            """
+            return isinstance(self.query, types.UpdateInlineBotCallbackQuery)
+
         async def respond(self, *args, **kwargs):
             """
             Responds to the message (not as a reply). Shorthand for
@@ -208,6 +228,8 @@ class CallbackQuery(EventBuilder):
             ``entity`` already set.
 
             This method also creates a task to `answer` the callback.
+
+            This method will likely fail if `via_inline` is ``True``.
             """
             self._client.loop.create_task(self.answer())
             return await self._client.send_message(
@@ -220,6 +242,8 @@ class CallbackQuery(EventBuilder):
             both ``entity`` and ``reply_to`` already set.
 
             This method also creates a task to `answer` the callback.
+
+            This method will likely fail if `via_inline` is ``True``.
             """
             self._client.loop.create_task(self.answer())
             kwargs['reply_to'] = self.query.msg_id
@@ -228,11 +252,11 @@ class CallbackQuery(EventBuilder):
 
         async def edit(self, *args, **kwargs):
             """
-            Edits the message iff it's outgoing. Shorthand for
+            Edits the message. Shorthand for
             `telethon.client.messages.MessageMethods.edit_message` with
-            both ``entity`` and ``message`` already set.
+            the ``entity`` set to the correct :tl:`InputBotInlineMessageID`.
 
-            Returns the edited `Message <telethon.tl.custom.message.Message>`.
+            Returns ``True`` if the edit was successful.
 
             This method also creates a task to `answer` the callback.
 
@@ -243,10 +267,15 @@ class CallbackQuery(EventBuilder):
                 since the message object is normally not present.
             """
             self._client.loop.create_task(self.answer())
-            return await self._client.edit_message(
-                await self.get_input_chat(), self.query.msg_id,
-                *args, **kwargs
-            )
+            if isinstance(self.query.msg_id, types.InputBotInlineMessageID):
+                return await self._client.edit_message(
+                    self.query.msg_id, *args, **kwargs
+                )
+            else:
+                return await self._client.edit_message(
+                    await self.get_input_chat(), self.query.msg_id,
+                    *args, **kwargs
+                )
 
         async def delete(self, *args, **kwargs):
             """
@@ -259,6 +288,8 @@ class CallbackQuery(EventBuilder):
             `telethon.client.telegramclient.TelegramClient` instance directly.
 
             This method also creates a task to `answer` the callback.
+
+            This method will likely fail if `via_inline` is ``True``.
             """
             self._client.loop.create_task(self.answer())
             return await self._client.delete_messages(

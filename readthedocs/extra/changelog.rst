@@ -13,6 +13,254 @@ it can take advantage of new goodies!
 
 .. contents:: List of All Versions
 
+Fix-up for Photo Downloads (v1.7.1)
+===================================
+
+*Published at 2019/04/24*
+
+Telegram changed the way thumbnails (which includes photos) are downloaded,
+so you can no longer use a :tl:`PhotoSize` alone to download a particular
+thumbnail size (this is a **breaking change**).
+
+Instead, you will have to specify the new ``thumb`` parameter in
+`client.download_media() <telethon.client.downloads.DownloadMethods.download_media>`
+to download a particular thumbnail size. This addition enables you to easily
+download thumbnails from documents, something you couldn't do easily before.
+
+
+Easier Events (v1.7)
+====================
+
+*Published at 2019/04/22*
+
++-----------------------+
+| Scheme layer used: 98 |
++-----------------------+
+
+If you have been using Telethon for a while, you probably know how annoying
+the "Could not find the input entity for…" error can be. In this new version,
+the library will try harder to find the input entity for you!
+
+That is, instead of doing:
+
+.. code-block:: python
+
+    @client.on(events.NewMessage)
+    async def handler(event):
+        await client.download_profile_photo(await event.get_input_sender())
+        # ...... needs await, it's a method ^^^^^                       ^^
+
+You can now do:
+
+.. code-block:: python
+
+    @client.on(events.NewMessage)
+    async def handler(event):
+        await client.download_profile_photo(event.input_sender)
+        # ...... no await, it's a property! ^
+        # It's also 12 characters shorter :)
+
+And even the following will hopefully work:
+
+.. code-block:: python
+
+    @client.on(events.NewMessage)
+    async def handler(event):
+        await client.download_profile_photo(event.sender_id)
+
+A lot of people use IDs thinking this is the right way of doing it. Ideally,
+you would always use ``input_*``, not ``sender`` or ``sender_id`` (and the
+same applies to chats). But, with this change, IDs will work just the same as
+``input_*`` inside events.
+
+**This feature still needs some more testing**, so please do open an issue
+if you find strange behaviour.
+
+
+Breaking Changes
+~~~~~~~~~~~~~~~~
+
+* The layer changed, and a lot of things did too. If you are using
+  raw API, you should be careful with this. In addition, some attributes
+  weren't of type ``datetime`` when they should be, which has been fixed.
+* Due to the layer change, you can no longer download photos with just
+  their :tl:`PhotoSize`. Version 1.7.1 introduces a new way to download
+  thumbnails to work around this issue.
+* `client.disconnect()
+  <telethon.client.telegrambaseclient.TelegramBaseClient.disconnect>`
+  is now asynchronous again. This means you need to ``await`` it. You
+  don't need to worry about this if you were using ``with client`` or
+  `client.run_until_disconnected
+  <telethon.client.updates.UpdateMethods.run_until_disconnected>`.
+  This should prevent the "pending task was destroyed" errors.
+
+Additions
+~~~~~~~~~
+
+* New in-memory cache for input entities. This should mean a lot less
+  of disk look-ups.
+* New `client.action <telethon.client.chats.ChatMethods.action>` method
+  to easily indicate that you are doing some chat action:
+
+  .. code-block:: python
+
+        async with client.action(chat, 'typing'):
+            await asyncio.sleep(2)  # type for 2 seconds
+            await client.send_message(chat, 'Hello world! I type slow ^^')
+
+  You can also easily use this for sending files, playing games, etc.
+
+
+New bugs
+~~~~~~~~
+
+* Downloading photos is broken. This is fixed in v1.7.1.
+
+Bug fixes
+~~~~~~~~~
+
+* Fix sending photos from streams/bytes.
+* Fix unhandled error when sending requests that were too big.
+* Fix edits that arrive too early on conversations.
+* Fix `client.edit_message()
+  <telethon.client.messages.MessageMethods.edit_message>`
+  when trying to edit a file.
+* Fix method calls on the objects returned by `client.iter_dialogs()
+  <telethon.client.dialogs.DialogMethods.iter_dialogs>`.
+* Attempt at fixing `client.iter_dialogs()
+  <telethon.client.dialogs.DialogMethods.iter_dialogs>` missing many dialogs.
+* ``offset_date`` in `client.iter_messages()
+  <telethon.client.messages.MessageMethods.iter_messages>` was being
+  ignored in some cases. This has been worked around.
+* Fix `callback_query.edit()
+  <telethon.events.callbackquery.CallbackQuery.Event.edit>`.
+* Fix `CallbackQuery(func=...) <telethon.events.callbackquery.CallbackQuery>`
+  was being ignored.
+* Fix `UserUpdate <telethon.events.userupdate.UserUpdate>` not working for
+  "typing" (and uploading file, etc.) status.
+* Fix library was not expecting ``IOError`` from PySocks.
+* Fix library was raising a generic ``ConnectionError``
+  and not the one that actually occurred.
+* Fix the ``blacklist_chats`` parameter in `MessageRead
+  <telethon.events.messageread.MessageRead>` not working as intended.
+* Fix `client.download_media(contact)
+  <telethon.client.downloads.DownloadMethods.download_media>`.
+* Fix mime type when sending ``mp3`` files.
+* Fix forcibly getting the sender or chat from events would
+  not always return all their information.
+* Fix sending albums with `client.send_file()
+  <telethon.client.uploads.UploadMethods.send_file>` was not returning
+  the sent messages.
+* Fix forwarding albums with `client.forward_messages()
+  <telethon.client.messages.MessageMethods.forward_messages>`.
+* Some fixes regarding filtering updates from chats.
+* Attempt at preventing duplicated updates.
+* Prevent double auto-reconnect.
+
+
+Enhancements
+~~~~~~~~~~~~
+
+* Some improvements related to proxy connections.
+* Several updates and improvements to the documentation,
+  such as optional dependencies now being properly listed.
+* You can now forward messages from different chats directly with
+  `client.forward_messages <telethon.client.messages.MessageMethods.forward_messages>`.
+
+
+Tidying up Internals (v1.6)
+===========================
+
+*Published at 2019/02/27*
+
++-----------------------+
+| Scheme layer used: 95 |
++-----------------------+
+
+First things first, sorry for updating the layer in the previous patch
+version. That should only be done between major versions ideally, but
+due to how Telegram works, it's done between minor versions. However raw
+API has and will always be considered "unsafe", this meaning that you
+should always use the convenience client methods instead. These methods
+don't cover the full API yet, so pull requests are welcome.
+
+Breaking Changes
+~~~~~~~~~~~~~~~~
+
+* The layer update, of course. This didn't really need a mention here.
+* You can no longer pass a ``batch_size`` when iterating over messages.
+  No other method exposed this parameter, and it was only meant for testing
+  purposes. Instead, it's now a private constant.
+* ``client.iter_*`` methods no longer have a ``_total`` parameter which
+  was supposed to be private anyway. Instead, they return a new generator
+  object which has a ``.total`` attribute:
+
+  .. code-block:: python
+
+      it = client.iter_messages(chat)
+      for i, message in enumerate(it, start=1):
+          percentage = i / it.total
+          print('{:.2%} {}'.format(percentage, message.text))
+
+Additions
+~~~~~~~~~
+
+* You can now pass ``phone`` and ``phone_code_hash`` in `client.sign_up
+  <telethon.client.auth.AuthMethods.sign_up>`, although you probably don't
+  need that.
+* Thanks to the overhaul of all ``client.iter_*`` methods, you can now do:
+
+  .. code-block:: python
+
+      for message in reversed(client.iter_messages('me')):
+          print(message.text)
+
+Bug fixes
+~~~~~~~~~
+
+* Fix `telethon.utils.resolve_bot_file_id`, which wasn't working after
+  the layer update (so you couldn't send some files by bot file IDs).
+* Fix sending albums as bot file IDs (due to image detection improvements).
+* Fix `takeout() <telethon.client.account.AccountMethods.takeout>` failing
+  when they need to download media from other DCs.
+* Fix repeatedly calling `conversation.get_response()
+  <telethon.tl.custom.conversation.Conversation.get_response>` when many
+  messages arrived at once (i.e. when several of them were forwarded).
+* Fixed connecting with `ConnectionTcpObfuscated
+  <telethon.network.connection.tcpobfuscated.ConnectionTcpObfuscated>`.
+* Fix `client.get_peer_id('me')
+  <telethon.client.users.UserMethods.get_peer_id>`.
+* Fix warning of "missing sqlite3" when in reality it just had wrong tables.
+* Fix a strange error when using too many IDs in `client.delete_messages()
+  <telethon.client.messages.MessageMethods.delete_messages>`.
+* Fix `client.send_file <telethon.client.uploads.UploadMethods.send_file>`
+  with the result of `client.upload_file
+  <telethon.client.uploads.UploadMethods.upload_file>`.
+* When answering inline results, their order was not being preserved.
+* Fix `events.ChatAction <telethon.events.chataction.ChatAction>`
+  detecting user leaves as if they were kicked.
+
+Enhancements
+~~~~~~~~~~~~
+
+* Cleared up some parts of the documentation.
+* Improved some auto-casts to make life easier.
+* Improved image detection. Now you can easily send ``bytes``
+  and streams of images as photos, unless you force document.
+* Sending images as photos that are too large will now be resized
+  before uploading, reducing the time it takes to upload them and
+  also avoiding errors when the image was too large (as long as
+  ``pillow`` is installed). The images will remain unchanged if you
+  send it as a document.
+* Treat ``errors.RpcMcgetFailError`` as a temporary server error
+  to automatically retry shortly. This works around most issues.
+
+Internal changes
+~~~~~~~~~~~~~~~~
+
+* New common way to deal with retries (``retry_range``).
+* Cleaned up the takeout client.
+* Completely overhauled asynchronous generators.
 
 Layer Update (v1.5.5)
 =====================

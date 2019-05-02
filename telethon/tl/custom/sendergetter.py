@@ -26,7 +26,14 @@ class SenderGetter(abc.ABC):
         Returns `sender`, but will make an API call to find the
         sender unless it's already cached.
         """
-        if self._sender is None and await self.get_input_sender():
+        # ``sender.min`` is present both in :tl:`User` and :tl:`Channel`.
+        # It's a flag that will be set if only minimal information is
+        # available (such as display name, but username may be missing),
+        # in which case we want to force fetch the entire thing because
+        # the user explicitly called a method. If the user is okay with
+        # cached information, they may use the property instead.
+        if (self._sender is None or self._sender.min) \
+                and await self.get_input_sender():
             try:
                 self._sender =\
                     await self._client.get_entity(self._input_sender)
@@ -44,10 +51,10 @@ class SenderGetter(abc.ABC):
         Note that this might not be available if the library can't
         find the input chat, or if the message a broadcast on a channel.
         """
-        if self._input_sender is None and self._sender_id:
+        if self._input_sender is None and self._sender_id and self._client:
             try:
-                self._input_sender = self._client.session\
-                    .get_input_entity(self._sender_id)
+                self._input_sender = \
+                    self._client._entity_cache[self._sender_id]
             except ValueError:
                 pass
         return self._input_sender
@@ -57,7 +64,7 @@ class SenderGetter(abc.ABC):
         Returns `input_sender`, but will make an API call to find the
         input sender unless it's already cached.
         """
-        if self.input_sender is None and self._sender_id:
+        if self.input_sender is None and self._sender_id and self._client:
             await self._refetch_sender()
         return self._input_sender
 

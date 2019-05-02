@@ -1,9 +1,10 @@
 import abc
 import asyncio
+import itertools
 import warnings
 
 from .. import utils
-from ..tl import TLObject, types
+from ..tl import TLObject, types, functions
 from ..tl.custom.chatgetter import ChatGetter
 
 
@@ -69,7 +70,7 @@ class EventBuilder(abc.ABC):
 
     def __init__(self, chats=None, *, blacklist_chats=False, func=None):
         self.chats = chats
-        self.blacklist_chats = blacklist_chats
+        self.blacklist_chats = bool(blacklist_chats)
         self.resolved = False
         self.func = func
         self._resolve_lock = None
@@ -108,7 +109,8 @@ class EventBuilder(abc.ABC):
             return None
 
         if self.chats is not None:
-            inside = utils.get_peer_id(event._chat_peer) in self.chats
+            # Note: the `event.chat_id` property checks if it's `None` for us
+            inside = event.chat_id in self.chats
             if inside == self.blacklist_chats:
                 # If this chat matches but it's a blacklist ignore.
                 # If it doesn't match but it's a whitelist ignore.
@@ -136,8 +138,6 @@ class EventCommon(ChatGetter, abc.ABC):
         self._client = None
         self._chat_peer = chat_peer
         self._message_id = msg_id
-        self._input_chat = None
-        self._chat = None
         self._broadcast = broadcast
         self.original_update = None
 
@@ -146,19 +146,11 @@ class EventCommon(ChatGetter, abc.ABC):
         Setter so subclasses can act accordingly when the client is set.
         """
         self._client = client
-        self._chat = self._entities.get(self.chat_id)
-        if not self._chat:
-            return
-
-        try:
-            self._input_chat = utils.get_input_peer(self._chat)
-        except TypeError:
-            try:
-                self._input_chat = self._client.session.get_input_entity(
-                    self._chat_peer
-                )
-            except ValueError:
-                self._input_chat = None
+        if self._chat_peer:
+            self._chat, self._input_chat = utils._get_entity_pair(
+                self.chat_id, self._entities, client._entity_cache)
+        else:
+            self._chat = self._input_chat = None
 
     @property
     def client(self):

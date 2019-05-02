@@ -8,6 +8,7 @@ import imghdr
 import inspect
 import io
 import itertools
+import logging
 import math
 import mimetypes
 import os
@@ -42,7 +43,7 @@ mimetypes.add_type('video/mp4', '.mp4')
 mimetypes.add_type('video/quicktime', '.mov')
 mimetypes.add_type('video/avi', '.avi')
 
-mimetypes.add_type('audio/mp3', '.mp3')
+mimetypes.add_type('audio/mpeg', '.mp3')
 mimetypes.add_type('audio/m4a', '.m4a')
 mimetypes.add_type('audio/aac', '.aac')
 mimetypes.add_type('audio/ogg', '.ogg')
@@ -65,6 +66,8 @@ VALID_USERNAME_RE = re.compile(
     r'|gif|vid|pic|bing|wiki|imdb|bold|vote|like|coub|ya)$',
     re.IGNORECASE
 )
+
+_log = logging.getLogger(__name__)
 
 
 def chunks(iterable, size=100):
@@ -417,13 +420,6 @@ def get_input_media(
     if isinstance(media, types.MessageMediaGame):
         return types.InputMediaGame(id=media.game.id)
 
-    if isinstance(media, (types.ChatPhoto, types.UserProfilePhoto)):
-        if isinstance(media.photo_big, types.FileLocationUnavailable):
-            media = media.photo_small
-        else:
-            media = media.photo_big
-        return get_input_media(media, is_photo=True)
-
     if isinstance(media, types.MessageMediaContact):
         return types.InputMediaContact(
             phone_number=media.phone_number,
@@ -448,7 +444,8 @@ def get_input_media(
     if isinstance(media, (
             types.MessageMediaEmpty, types.MessageMediaUnsupported,
             types.ChatPhotoEmpty, types.UserProfilePhotoEmpty,
-            types.FileLocationUnavailable)):
+            types.ChatPhoto, types.UserProfilePhoto,
+            types.FileLocationToBeDeprecated)):
         return types.InputMediaEmpty()
 
     if isinstance(media, types.Message):
@@ -472,6 +469,24 @@ def get_input_message(message):
     _raise_cast_fail(message, 'InputMedia')
 
 
+def _get_entity_pair(entity_id, entities, cache,
+                     get_input_peer=get_input_peer):
+    """
+    Returns ``(entity, input_entity)`` for the given entity ID.
+    """
+    entity = entities.get(entity_id)
+    try:
+        input_entity = cache[entity_id]
+    except KeyError:
+        # KeyError is unlikely, so another TypeError won't hurt
+        try:
+            input_entity = get_input_peer(entity)
+        except TypeError:
+            input_entity = None
+
+    return entity, input_entity
+
+
 def get_message_id(message):
     """Similar to :meth:`get_input_peer`, but for message IDs."""
     if message is None:
@@ -490,6 +505,19 @@ def get_message_id(message):
     raise TypeError('Invalid message type: {}'.format(type(message)))
 
 
+def _get_metadata(file):
+    # `hachoir` only deals with paths to in-disk files, while
+    # `_get_extension` supports a few other things. The parser
+    # may also fail in any case and we don't want to crash if
+    # the extraction process fails.
+    if hachoir and isinstance(file, str) and os.path.isfile(file):
+        try:
+            with hachoir.parser.createParser(file) as parser:
+                return hachoir.metadata.extractMetadata(parser)
+        except Exception as e:
+            _log.warning('Failed to analyze %s: %s %s', file, e.__class__, e)
+
+
 def get_attributes(file, *, attributes=None, mime_type=None,
                    force_document=False, voice_note=False, video_note=False,
                    supports_streaming=False):
@@ -505,9 +533,9 @@ def get_attributes(file, *, attributes=None, mime_type=None,
     attr_dict = {types.DocumentAttributeFilename:
         types.DocumentAttributeFilename(os.path.basename(name))}
 
-    if is_audio(file) and hachoir is not None:
-        with hachoir.parser.createParser(file) as parser:
-            m = hachoir.metadata.extractMetadata(parser)
+    if is_audio(file):
+        m = _get_metadata(file)
+        if m:
             attr_dict[types.DocumentAttributeAudio] = \
                 types.DocumentAttributeAudio(
                     voice=voice_note,
@@ -518,17 +546,16 @@ def get_attributes(file, *, attributes=None, mime_type=None,
                 )
 
     if not force_document and is_video(file):
-        if hachoir:
-            with hachoir.parser.createParser(file) as parser:
-                m = hachoir.metadata.extractMetadata(parser)
-                doc = types.DocumentAttributeVideo(
-                    round_message=video_note,
-                    w=m.get('width') if m.has('width') else 0,
-                    h=m.get('height') if m.has('height') else 0,
-                    duration=int(m.get('duration').seconds
-                                 if m.has('duration') else 0),
-                    supports_streaming=supports_streaming
-                )
+        m = _get_metadata(file)
+        if m:
+            doc = types.DocumentAttributeVideo(
+                round_message=video_note,
+                w=m.get('width') if m.has('width') else 0,
+                h=m.get('height') if m.has('height') else 0,
+                duration=int(m.get('duration').seconds
+                             if m.has('duration') else 0),
+                supports_streaming=supports_streaming
+            )
         else:
             doc = types.DocumentAttributeVideo(
                 0, 1, 1, round_message=video_note,
@@ -615,24 +642,20 @@ def get_input_location(location):
 
     if isinstance(location, types.Document):
         return (location.dc_id, types.InputDocumentFileLocation(
-            location.id, location.access_hash,
-            file_reference=location.file_reference
+            id=location.id,
+            access_hash=location.access_hash,
+            file_reference=location.file_reference,
+            thumb_size=''  # Presumably to download one of its thumbnails
         ))
     elif isinstance(location, types.Photo):
-        try:
-            location = next(
-                x for x in reversed(location.sizes)
-                if not isinstance(x, types.PhotoSizeEmpty)
-            ).location
-        except StopIteration:
-            pass
-
-    if isinstance(location, types.FileLocation):
-        return (location.dc_id, types.InputFileLocation(
-            location.volume_id, location.local_id, location.secret,
-            file_reference=location.file_reference
+        return (location.dc_id, types.InputPhotoFileLocation(
+            id=location.id,
+            access_hash=location.access_hash,
+            file_reference=location.file_reference,
+            thumb_size=location.sizes[-1].type
         ))
-    elif isinstance(location, types.FileLocationUnavailable):
+
+    if isinstance(location, types.FileLocationToBeDeprecated):
         raise TypeError('Unavailable location cannot be used as input')
 
     _raise_cast_fail(location, 'InputFileLocation')
@@ -649,8 +672,8 @@ def _get_extension(file):
         kind = imghdr.what(io.BytesIO(file))
         return ('.' + kind) if kind else ''
     elif isinstance(file, io.IOBase) and file.seekable():
-        kind = imghdr.what(file) is not None
-        return ('.' + kind) if kind else ''
+        kind = imghdr.what(file)
+        return ('.' + kind) if kind is not None else ''
     elif getattr(file, 'name', None):
         # Note: ``file.name`` works for :tl:`InputFile` and some `IOBase`
         return _get_extension(file.name)
@@ -662,7 +685,11 @@ def is_image(file):
     """
     Returns ``True`` if the file extension looks like an image file to Telegram.
     """
-    return re.match(r'\.(png|jpe?g)', _get_extension(file), re.IGNORECASE)
+    match = re.match(r'\.(png|jpe?g)', _get_extension(file), re.IGNORECASE)
+    if match:
+        return True
+    else:
+        return isinstance(resolve_bot_file_id(file), types.Photo)
 
 
 def is_gif(file):
@@ -762,6 +789,8 @@ def get_peer(peer):
             return peer.peer
         elif isinstance(peer, types.ChannelFull):
             return types.PeerChannel(peer.id)
+        elif isinstance(peer, types.DialogPeer):
+            return peer.peer
 
         if peer.SUBCLASS_OF_ID in (0x7d7c6f86, 0xd9c7fc18):
             # ChatParticipant, ChannelParticipant
@@ -969,15 +998,24 @@ def resolve_bot_file_id(file_id):
 
         # Thumbnails (small) always have ID 0; otherwise size 'x'
         photo_size = 's' if media_id or access_hash else 'x'
-        return types.Photo(id=media_id, access_hash=access_hash, sizes=[
-            types.PhotoSize(photo_size, location=types.FileLocation(
-                dc_id=dc_id,
-                volume_id=volume_id,
-                secret=secret,
-                local_id=local_id,
-                file_reference=b''
-            ), w=0, h=0, size=0)
-        ], file_reference=b'', date=None)
+        return types.Photo(
+            id=media_id,
+            access_hash=access_hash,
+            file_reference=b'',
+            date=None,
+            sizes=[types.PhotoSize(
+                type=photo_size,
+                location=types.FileLocationToBeDeprecated(
+                    volume_id=volume_id,
+                    local_id=local_id
+                ),
+                w=0,
+                h=0,
+                size=0
+            )],
+            dc_id=dc_id,
+            has_stickers=None
+        )
 
 
 def pack_bot_file_id(file):
@@ -1016,13 +1054,13 @@ def pack_bot_file_id(file):
         size = next((x for x in reversed(file.sizes) if isinstance(
             x, (types.PhotoSize, types.PhotoCachedSize))), None)
 
-        if not size or not isinstance(size.location, types.FileLocation):
+        if not size:
             return None
 
         size = size.location
         return _encode_telegram_base64(_rle_encode(struct.pack(
-            '<iiqqqqib', 2, size.dc_id, file.id, file.access_hash,
-            size.volume_id, size.secret, size.local_id, 2
+            '<iiqqqqib', 2, file.dc_id, file.id, file.access_hash,
+            size.volume_id, 0, size.local_id, 2  # 0 = old `secret`
         )))
     else:
         return None
@@ -1105,3 +1143,19 @@ class AsyncClassWrapper:
             return w.fget(self.wrapped)
         else:
             return w
+
+
+def stripped_photo_to_jpg(stripped):
+    """
+    Adds the JPG header and footer to a stripped image.
+
+    Ported from https://github.com/telegramdesktop/tdesktop/blob/bec39d89e19670eb436dc794a8f20b657cb87c71/Telegram/SourceFiles/ui/image/image.cpp#L225
+    """
+    if len(stripped) < 3 or stripped[0] != 1:
+        return stripped
+
+    header = bytearray(b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00(\x1c\x1e#\x1e\x19(#!#-+(0<dA<77<{X]Id\x91\x80\x99\x96\x8f\x80\x8c\x8a\xa0\xb4\xe6\xc3\xa0\xaa\xda\xad\x8a\x8c\xc8\xff\xcb\xda\xee\xf5\xff\xff\xff\x9b\xc1\xff\xff\xff\xfa\xff\xe6\xfd\xff\xf8\xff\xdb\x00C\x01+--<5<vAAv\xf8\xa5\x8c\xa5\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xf8\xff\xc0\x00\x11\x08\x00\x00\x00\x00\x03\x01"\x00\x02\x11\x01\x03\x11\x01\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xc4\x00\xb5\x10\x00\x02\x01\x03\x03\x02\x04\x03\x05\x05\x04\x04\x00\x00\x01}\x01\x02\x03\x00\x04\x11\x05\x12!1A\x06\x13Qa\x07"q\x142\x81\x91\xa1\x08#B\xb1\xc1\x15R\xd1\xf0$3br\x82\t\n\x16\x17\x18\x19\x1a%&\'()*456789:CDEFGHIJSTUVWXYZcdefghijstuvwxyz\x83\x84\x85\x86\x87\x88\x89\x8a\x92\x93\x94\x95\x96\x97\x98\x99\x9a\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xff\xc4\x00\x1f\x01\x00\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xc4\x00\xb5\x11\x00\x02\x01\x02\x04\x04\x03\x04\x07\x05\x04\x04\x00\x01\x02w\x00\x01\x02\x03\x11\x04\x05!1\x06\x12AQ\x07aq\x13"2\x81\x08\x14B\x91\xa1\xb1\xc1\t#3R\xf0\x15br\xd1\n\x16$4\xe1%\xf1\x17\x18\x19\x1a&\'()*56789:CDEFGHIJSTUVWXYZcdefghijstuvwxyz\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x92\x93\x94\x95\x96\x97\x98\x99\x9a\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00?\x00')
+    footer = b"\xff\xd9"
+    header[164] = stripped[1]
+    header[166] = stripped[2]
+    return bytes(header) + stripped[3:] + footer

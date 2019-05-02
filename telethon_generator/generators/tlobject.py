@@ -34,6 +34,18 @@ NAMED_AUTO_CASTS = {
     ('chat_id', 'int'): 'await client.get_peer_id({}, add_mark=False)'
 }
 
+# Secret chats have a chat_id which may be negative.
+# With the named auto-cast above, we would break it.
+# However there are plenty of other legit requests
+# with `chat_id:int` where it is useful.
+#
+# NOTE: This works because the auto-cast is not recursive.
+#       There are plenty of types that would break if we
+#       did recurse into them to resolve them.
+NAMED_BLACKLIST = {
+    'messages.discardEncryption'
+}
+
 BASE_TYPES = ('string', 'bytes', 'int', 'long', 'int128',
               'int256', 'double', 'Bool', 'true', 'date')
 
@@ -65,9 +77,9 @@ def _write_modules(
             # Add the relative imports to the namespaces,
             # unless we already are in a namespace.
             if not ns:
-                builder.writeln('from . import {}', ', '.join(
+                builder.writeln('from . import {}', ', '.join(sorted(
                     x for x in namespace_tlobjects.keys() if x
-                ))
+                )))
 
             # Import 'os' for those needing access to 'os.urandom()'
             # Currently only 'random_id' needs 'os' to be imported,
@@ -76,6 +88,9 @@ def _write_modules(
 
             # Import struct for the .__bytes__(self) serialization
             builder.writeln('import struct')
+
+            # Import datetime for type hinting
+            builder.writeln('from datetime import datetime')
 
             tlobjects.sort(key=lambda x: x.name)
 
@@ -105,8 +120,8 @@ def _write_modules(
                                                 for c in constructors)))
 
             imports = {}
-            primitives = ('int', 'long', 'int128', 'int256', 'string',
-                          'date', 'bytes', 'true')
+            primitives = {'int', 'long', 'int128', 'int256', 'double',
+                          'string', 'date', 'bytes', 'Bool', 'true'}
             # Find all the types in other files that are used in this file
             # and generate the information required to import those types.
             for t in tlobjects:
@@ -135,7 +150,7 @@ def _write_modules(
                 builder.writeln('if TYPE_CHECKING:')
                 for namespace, names in imports.items():
                     builder.writeln('from {} import {}',
-                                    namespace, ', '.join(names))
+                                    namespace, ', '.join(sorted(names)))
 
                 builder.end_block()
 
@@ -182,24 +197,17 @@ def _write_class_init(tlobject, kind, type_constructors, builder):
     builder.writeln()
 
     # Convert the args to string parameters, flags having =None
-    args = [(a.name if not a.is_flag and not a.can_be_inferred
-             else '{}=None'.format(a.name)) for a in tlobject.real_args]
+    args = ['{}: {}{}'.format(
+        a.name, a.type_hint(), '=None' if a.is_flag or a.can_be_inferred else '')
+        for a in tlobject.real_args
+    ]
 
     # Write the __init__ function if it has any argument
     if not tlobject.real_args:
         return
 
-    builder.writeln('def __init__({}):', ', '.join(['self'] + args))
-    # Write the docstring, to know the type of the args
+    builder.writeln("def __init__({}):", ', '.join(['self'] + args))
     builder.writeln('"""')
-    for arg in tlobject.real_args:
-        if not arg.flag_indicator:
-            builder.writeln(':param {} {}:', arg.type_hint(), arg.name)
-            builder.current_indent -= 1  # It will auto-indent (':')
-
-    # We also want to know what type this request returns
-    # or to which type this constructor belongs to
-    builder.writeln()
     if tlobject.is_function:
         builder.write(':returns {}: ', tlobject.result)
     else:
@@ -220,8 +228,7 @@ def _write_class_init(tlobject, kind, type_constructors, builder):
     # Set the arguments
     for arg in tlobject.real_args:
         if not arg.can_be_inferred:
-            builder.writeln('self.{0} = {0}  # type: {1}',
-                            arg.name, arg.type_hint())
+            builder.writeln('self.{0} = {0}', arg.name)
 
         # Currently the only argument that can be
         # inferred are those called 'random_id'
@@ -253,7 +260,8 @@ def _write_class_init(tlobject, kind, type_constructors, builder):
 def _write_resolve(tlobject, builder):
     if tlobject.is_function and any(
             (arg.type in AUTO_CASTS
-             or ((arg.name, arg.type) in NAMED_AUTO_CASTS))
+             or ((arg.name, arg.type) in NAMED_AUTO_CASTS
+                 and tlobject.fullname not in NAMED_BLACKLIST))
             for arg in tlobject.real_args
     ):
         builder.writeln('async def resolve(self, client, utils):')

@@ -3,15 +3,55 @@ Helper module around the system's libssl library if available for IGE mode.
 """
 import ctypes
 import ctypes.util
+import logging
+import os
+
+__log__ = logging.getLogger(__name__)
 
 
 lib = ctypes.util.find_library('ssl')
-if not lib:
+
+# This is a best-effort attempt at finding the full real path of lib.
+#
+# Unfortunately ctypes doesn't tell us *where* it finds the library,
+# so we have to do that ourselves.
+try:
+    # This is not documented, so it could fail. Be on the safe side.
+    import ctypes.macholib.dyld
+    paths = ctypes.macholib.dyld.DEFAULT_LIBRARY_FALLBACK
+except (ImportError, AttributeError):
+    paths = [
+        os.path.expanduser("~/lib"),
+        "/usr/local/lib",
+        "/lib",
+        "/usr/lib",
+    ]
+
+for path in paths:
+    if os.path.isdir(path):
+        for root, _, files in os.walk(path):
+            if lib in files:
+                # Manually follow symbolic links on *nix systems.
+                # Fix for https://github.com/LonamiWebs/Telethon/issues/1167
+                lib = os.path.realpath(os.path.join(root, lib))
+                break
+
+
+try:
+    if not lib:
+        raise OSError('no library called "ssl" found')
+
+    _libssl = ctypes.cdll.LoadLibrary(lib)
+except OSError as e:
+    # See https://github.com/LonamiWebs/Telethon/issues/1167
+    # Sometimes `find_library` returns improper filenames.
+    __log__.info('Failed to load %s: %s (%s)', lib, type(e), e)
+    _libssl = None
+
+if not _libssl:
     decrypt_ige = None
     encrypt_ige = None
 else:
-    _libssl = ctypes.cdll.LoadLibrary(lib)
-
     # https://github.com/openssl/openssl/blob/master/include/openssl/aes.h
     AES_ENCRYPT = ctypes.c_int(1)
     AES_DECRYPT = ctypes.c_int(0)

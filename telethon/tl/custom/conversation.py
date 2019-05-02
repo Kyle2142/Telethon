@@ -3,7 +3,13 @@ import itertools
 import time
 
 from .chatgetter import ChatGetter
-from ... import utils, errors
+from ... import helpers, utils, errors
+from ...events.common import EventCommon
+
+# Sometimes the edits arrive very fast (within the same second).
+# In that case we add a small delta so that the age is older, for
+# comparision purposes. This value is enough for up to 1000 messages.
+_EDIT_COLLISION_DELTA = 0.001
 
 
 class Conversation(ChatGetter):
@@ -117,7 +123,7 @@ class Conversation(ChatGetter):
                 is expected. By default this is the last sent message.
 
             timeout (`int` | `float`, optional):
-                If present, this `timeout` will override the
+                If present, this `timeout` (in seconds) will override the
                 per-action timeout defined for the conversation.
         """
         return await self._get_message(
@@ -155,7 +161,7 @@ class Conversation(ChatGetter):
                 once `condition` is met.
 
             timeout (`int`):
-                The timeout override to use for this operation.
+                The timeout (in seconds) override to use for this operation.
 
             condition (`callable`):
                 The condition callable that checks if an incoming
@@ -291,8 +297,9 @@ class Conversation(ChatGetter):
     async def _check_custom(self, built):
         for i, (ev, fut) in self._custom.items():
             ev_type = type(ev)
-            if built[ev_type] and ev.filter(built[ev_type]):
-                fut.set_result(built[ev_type])
+            inst = built[ev_type]
+            if inst and ev.filter(inst):
+                fut.set_result(inst)
 
     def _on_new_message(self, response):
         response = response.message
@@ -331,7 +338,15 @@ class Conversation(ChatGetter):
         for msg_id, pending in self._pending_edits.items():
             if msg_id < message.id:
                 found.append(msg_id)
-                self._edit_dates[msg_id] = message.edit_date.timestamp()
+                edit_ts = message.edit_date.timestamp()
+
+                # We compare <= because edit_ts resolution is always to
+                # seconds, but we may have increased _edit_dates before.
+                # Since the dates are ever growing this is not a problem.
+                if edit_ts <= self._edit_dates.get(msg_id, 0):
+                    self._edit_dates[msg_id] += _EDIT_COLLISION_DELTA
+                else:
+                    self._edit_dates[msg_id] = message.edit_date.timestamp()
 
         for msg_id in found:
             self._pending_edits.pop(msg_id).set_result(message)
@@ -352,7 +367,7 @@ class Conversation(ChatGetter):
             del self._pending_reads[to_remove]
 
     def _get_message_id(self, message):
-        if message:
+        if message is not None:  # 0 is valid but false-y, check for None
             return message if isinstance(message, int) else message.id
         elif self._last_outgoing:
             return self._last_outgoing
@@ -389,15 +404,6 @@ class Conversation(ChatGetter):
             else:
                 fut.cancel()
 
-    def __enter__(self):
-        if self._client.loop.is_running():
-            raise RuntimeError(
-                'You must use "async with" if the event loop '
-                'is running (i.e. you are inside an "async def")'
-            )
-
-        return self._client.loop.run_until_complete(self.__aenter__())
-
     async def __aenter__(self):
         self._input_chat = \
             await self._client.get_input_entity(self._input_chat)
@@ -433,9 +439,6 @@ class Conversation(ChatGetter):
         """Cancels the current conversation and exits the context manager."""
         raise _ConversationCancelled()
 
-    def __exit__(self, *args):
-        return self._client.loop.run_until_complete(self.__aexit__(*args))
-
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         chat_id = utils.get_peer_id(self._chat_peer)
         if self._client._ids_in_conversations[chat_id] == 1:
@@ -446,6 +449,9 @@ class Conversation(ChatGetter):
         del self._client._conversations[self._id]
         self._cancel_all()
         return isinstance(exc_val, _ConversationCancelled)
+
+    __enter__ = helpers._sync_enter
+    __exit__ = helpers._sync_exit
 
 
 class _ConversationCancelled(InterruptedError):

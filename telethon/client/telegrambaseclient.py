@@ -2,17 +2,18 @@ import abc
 import asyncio
 import logging
 import platform
-import sys
 import time
 from datetime import datetime, timezone
 
-from .. import version, __name__ as __base_name__
+from .. import version, helpers, __name__ as __base_name__
 from ..crypto import rsa
 from ..extensions import markdown
-from ..network import MTProtoSender, ConnectionTcpFull, ConnectionTcpMTProxy
+from ..network import MTProtoSender, ConnectionTcpFull, TcpMTProxy
 from ..sessions import Session, SQLiteSession, MemorySession
 from ..tl import TLObject, functions, types
 from ..tl.alltlobjects import LAYER
+from ..entitycache import EntityCache
+from ..statecache import StateCache
 
 DEFAULT_DC_ID = 4
 DEFAULT_IPV4_IP = '149.154.167.51'
@@ -23,6 +24,7 @@ __default_log__ = logging.getLogger(__base_name__)
 __default_log__.addHandler(logging.NullHandler())
 
 
+# TODO How hard would it be to support both `trio` and `asyncio`?
 class TelegramBaseClient(abc.ABC):
     """
     This is the abstract base class for the client. It defines some
@@ -63,7 +65,7 @@ class TelegramBaseClient(abc.ABC):
 
         proxy (`tuple` | `list` | `dict`, optional):
             An iterable consisting of the proxy info. If `connection` is
-            `ConnectionTcpMTProxy`, then it should contain MTProxy credentials:
+            one of `MTProxy`, then it should contain MTProxy credentials:
             ``('hostname', port, 'secret')``. Otherwise, it's meant to store
             function parameters for PySocks, like ``(type, 'hostname', port)``.
             See https://github.com/Anorov/PySocks#usage-1 for more.
@@ -228,14 +230,16 @@ class TelegramBaseClient(abc.ABC):
 
         self.flood_sleep_threshold = flood_sleep_threshold
 
-        # TODO Figure out how to use AsyncClassWrapper(session)
-        # The problem is that ChatGetter and SenderGetter rely
-        # on synchronous calls to session.get_entity precisely
-        # to avoid network access and the need for await.
+        # TODO Use AsyncClassWrapper(session)
+        # ChatGetter and SenderGetter can use the in-memory _entity_cache
+        # to avoid network access and the need for await in session files.
         #
-        # With asynchronous sessions, it would need await,
-        # and defeats the purpose of properties.
+        # The session files only wants the entities to persist
+        # them to disk, and to save additional useful information.
+        # TODO Session should probably return all cached
+        #      info of entities, not just the input versions
         self.session = session
+        self._entity_cache = EntityCache()
         self.api_id = int(api_id)
         self.api_hash = api_hash
 
@@ -248,8 +252,8 @@ class TelegramBaseClient(abc.ABC):
 
         assert isinstance(connection, type)
         self._connection = connection
-        init_proxy = None if connection is not ConnectionTcpMTProxy else \
-            types.InputClientProxy(*ConnectionTcpMTProxy.address_info(proxy))
+        init_proxy = None if not issubclass(connection, TcpMTProxy) else \
+            types.InputClientProxy(*connection.address_info(proxy))
 
         # Used on connection. Capture the variables in a lambda since
         # exporting clients need to create this InvokeWithLayerRequest.
@@ -301,10 +305,11 @@ class TelegramBaseClient(abc.ABC):
             self._dispatching_updates_queue = None
 
         self._authorized = None  # None = unknown, False = no, True = yes
-        self._state = self.session.get_update_state(0)
-        if not self._state:
-            self._state = types.updates.State(
-                0, 0, datetime.now(tz=timezone.utc), 0, 0)
+
+        # Update state (for catching up after a disconnection)
+        # TODO Get state from channels too
+        self._state_cache = StateCache(
+            self.session.get_update_state(0), self._log)
 
         # Some further state for subclasses
         self._event_builders = []
@@ -375,50 +380,39 @@ class TelegramBaseClient(abc.ABC):
         """
         Disconnects from Telegram.
 
-        Returns a dummy completed future with ``None`` as a result so
-        you can ``await`` this method just like every other method for
-        consistency or compatibility.
+        If the event loop is already running, this method returns a
+        coroutine that you should await on your own code; otherwise
+        the loop is ran until said coroutine completes.
         """
-        self._disconnect()
-        if getattr(self, 'session', None):
-            if getattr(self, '_state', None):
-                self.session.set_update_state(0, self._state)
-            self.session.close()
+        if self._loop.is_running():
+            return self._disconnect_coro()
+        else:
+            self._loop.run_until_complete(self._disconnect_coro())
 
-        result = self._loop.create_future()
-        result.set_result(None)
-        return result
+    async def _disconnect_coro(self):
+        await self._disconnect()
 
-    def _disconnect(self):
+        pts, date = self._state_cache[None]
+        self.session.set_update_state(0, types.updates.State(
+            pts=pts,
+            qts=0,
+            date=date,
+            seq=0,
+            unread_count=0
+        ))
+
+        self.session.close()
+
+    async def _disconnect(self):
         """
         Disconnect only, without closing the session. Used in reconnections
         to different data centers, where we don't want to close the session
         file; user disconnects however should close it since it means that
         their job with the client is complete and we should clean it up all.
         """
-        # All properties may be ``None`` if `__init__` fails, and this
-        # method will be called from `__del__` which would crash then.
-        if getattr(self, '_sender', None):
-            self._sender.disconnect()
-        if getattr(self, '_updates_handle', None):
-            self._updates_handle.cancel()
-
-    def __del__(self):
-        if not self.is_connected() or self.loop.is_closed():
-            return
-
-        # READ THIS IF DISCONNECT IS ASYNC AND A TASK WOULD BE MADE.
-        # Python 3.5.2's ``asyncio`` mod seems to have a bug where it's not
-        # able to close the pending tasks properly, and letting the script
-        # complete without calling disconnect causes the script to trigger
-        # 100% CPU load. Call disconnect to make sure it doesn't happen.
-        try:
-            self.disconnect()
-        except Exception:
-            # Arguably not the best solution, but worth trying if the user
-            # forgot to disconnect; normally this is fine but sometimes it
-            # can fail (https://github.com/LonamiWebs/Telethon/issues/1073)
-            pass
+        await self._sender.disconnect()
+        await helpers._cancel(self._log[__name__],
+                              updates_handle=self._updates_handle)
 
     async def _switch_dc(self, new_dc):
         """
@@ -433,7 +427,7 @@ class TelegramBaseClient(abc.ABC):
         self._sender.auth_key.key = None
         self.session.auth_key = None
         self.session.save()
-        self._disconnect()
+        await self._disconnect()
         return await self.connect()
 
     def _auth_key_callback(self, auth_key):
@@ -536,7 +530,7 @@ class TelegramBaseClient(abc.ABC):
             if not n:
                 self._log[__name__].info(
                     'Disconnecting borrowed sender for DC %d', dc_id)
-                sender.disconnect()
+                await sender.disconnect()
 
     async def _get_cdn_client(self, cdn_redirect):
         """Similar to ._borrow_exported_client, but for CDNs"""

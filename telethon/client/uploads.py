@@ -39,34 +39,37 @@ def _resize_photo_if_needed(
             or (isinstance(file, io.IOBase) and not file.seekable())):
         return file
 
-    before = file.tell() if isinstance(file, io.IOBase) else None
     if isinstance(file, bytes):
         file = io.BytesIO(file)
 
+    before = file.tell() if isinstance(file, io.IOBase) else None
+
     try:
-        with PIL.Image.open(file) as image:
-            if image.width <= width and image.height <= height:
-                return file
+        # Don't use a `with` block for `image`, or `file` would be closed.
+        # See https://github.com/LonamiWebs/Telethon/issues/1121 for more.
+        image = PIL.Image.open(file)
+        if image.width <= width and image.height <= height:
+            return file
 
-            image.thumbnail((width, height), PIL.Image.ANTIALIAS)
+        image.thumbnail((width, height), PIL.Image.ANTIALIAS)
 
-            alpha_index = image.mode.find('A')
-            if alpha_index == -1:
-                # If the image mode doesn't have alpha
-                # channel then don't bother masking it away.
-                result = image
-            else:
-                # We could save the resized image with the original format, but
-                # JPEG often compresses better -> smaller size -> faster upload
-                # We need to mask away the alpha channel ([3]), since otherwise
-                # IOError is raised when trying to save alpha channels in JPEG.
-                result = PIL.Image.new('RGB', image.size, background)
-                result.paste(image, mask=image.split()[alpha_index])
+        alpha_index = image.mode.find('A')
+        if alpha_index == -1:
+            # If the image mode doesn't have alpha
+            # channel then don't bother masking it away.
+            result = image
+        else:
+            # We could save the resized image with the original format, but
+            # JPEG often compresses better -> smaller size -> faster upload
+            # We need to mask away the alpha channel ([3]), since otherwise
+            # IOError is raised when trying to save alpha channels in JPEG.
+            result = PIL.Image.new('RGB', image.size, background)
+            result.paste(image, mask=image.split()[alpha_index])
 
-            buffer = io.BytesIO()
-            result.save(buffer, 'JPEG')
-            buffer.seek(0)
-            return buffer
+        buffer = io.BytesIO()
+        result.save(buffer, 'JPEG')
+        buffer.seek(0)
+        return buffer
 
     except IOError:
         return file
@@ -93,22 +96,44 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
                 Who will receive the file.
 
             file (`str` | `bytes` | `file` | `media`):
-                The path of the file, byte array, or stream that will be sent.
-                Note that if a byte array or a stream is given, a filename
-                or its type won't be inferred, and it will be sent as an
-                "unnamed application/octet-stream".
+                The file to send, which can be one of:
 
-                Furthermore the file may be any media (a message, document,
-                photo or similar) so that it can be resent without the need
-                to download and re-upload it again. Bot API ``file_id``
-                format is also supported.
+                * A local file path to an in-disk file. The file name
+                  will be the path's base name.
+
+                * A `bytes` byte array with the file's data to send
+                  (for example, by using ``text.encode('utf-8')``).
+                  A default file name will be used.
+
+                * A bytes `io.IOBase` stream over the file to send
+                  (for example, by using ``open(file, 'rb')``).
+                  Its ``.name`` property will be used for the file name,
+                  or a default if it doesn't have one.
+
+                * An external URL to a file over the internet. This will
+                  send the file as "external" media, and Telegram is the
+                  one that will fetch the media and send it.
+
+                * A Bot API-like ``file_id``. You can convert previously
+                  sent media to file IDs for later reusing with
+                  `telethon.utils.pack_bot_file_id`.
+
+                * A handle to an existing file (for example, if you sent a
+                  message with media before, you can use its ``message.media``
+                  as a file here).
+
+                * A handle to an uploaded file (from `upload_file`).
+
+                To send an album, you should provide a list in this parameter.
 
                 If a list or similar is provided, the files in it will be
                 sent as an album in the order in which they appear, sliced
                 in chunks of 10 if more than 10 are given.
 
             caption (`str`, optional):
-                Optional caption for the sent media message.
+                Optional caption for the sent media message. When sending an
+                album, the caption may be a list of strings, which will be
+                assigned to the files pairwise.
 
             force_document (`bool`, optional):
                 If left to ``False`` and the file is a path that ends with
@@ -245,7 +270,7 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
             caption, msg_entities =\
                 await self._parse_message_text(caption, parse_mode)
 
-        file_handle, media = await self._file_to_media(
+        file_handle, media, image = await self._file_to_media(
             file, force_document=force_document,
             progress_callback=progress_callback,
             attributes=attributes,  allow_cache=allow_cache, thumb=thumb,
@@ -263,7 +288,7 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
             entities=msg_entities, reply_markup=markup, silent=silent
         )
         msg = self._get_response_message(request, await self(request), entity)
-        await self._cache_media(msg, file, file_handle, force_document=force_document)
+        await self._cache_media(msg, file, file_handle, image=image)
 
         return msg
 
@@ -293,22 +318,26 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
         # Need to upload the media first, but only if they're not cached yet
         media = []
         for file in files:
-            # fh will either be InputPhoto or a modified InputFile
-            fh = await self.upload_file(file, use_cache=types.InputPhoto)
-            if not isinstance(fh, types.InputPhoto):
+            # Albums want :tl:`InputMedia` which, in theory, includes
+            # :tl:`InputMediaUploadedPhoto`. However using that will
+            # make it `raise MediaInvalidError`, so we need to upload
+            # it as media and then convert that to :tl:`InputMediaPhoto`.
+            fh, fm, _ = await self._file_to_media(file)
+            if isinstance(fm, types.InputMediaUploadedPhoto):
                 r = await self(functions.messages.UploadMediaRequest(
-                    entity, media=types.InputMediaUploadedPhoto(fh)
+                    entity, media=fm
                 ))
-                input_photo = utils.get_input_photo(r.photo)
-                self.session.cache_file(fh.md5, fh.size, input_photo)
-                fh = input_photo
+                self.session.cache_file(
+                    fh.md5, fh.size, utils.get_input_photo(r.photo))
+
+                fm = utils.get_input_media(r.photo)
 
             if captions:
                 caption, msg_entities = captions.pop()
             else:
                 caption, msg_entities = '', None
             media.append(types.InputSingleMedia(
-                types.InputMediaPhoto(fh),
+                fm,
                 message=caption,
                 entities=msg_entities
             ))
@@ -317,11 +346,18 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
         result = await self(functions.messages.SendMultiMediaRequest(
             entity, reply_to_msg_id=reply_to, multi_media=media, silent=silent
         ))
-        return [
-            self._get_response_message(update.id, result, entity)
-            for update in result.updates
-            if isinstance(update, types.UpdateMessageID)
-        ]
+
+        # We never sent a `random_id` for the messages that resulted from
+        # the request so we can't pair them up with the `Updates` that we
+        # get from Telegram. However, the sent messages have a photo and
+        # the photo IDs match with those we did send.
+        #
+        # Updates -> {_: message}
+        messages = self._get_response_message(None, result, entity)
+        # {_: message} -> {photo ID: message}
+        messages = {m.photo.id: m for m in messages.values()}
+        # Sent photo IDs -> messages
+        return [messages[m.media.id.id] for m in media]
 
     async def upload_file(
             self, file, *, part_size_kb=None, file_name=None, use_cache=None,
@@ -378,7 +414,17 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
         elif isinstance(file, bytes):
             file_size = len(file)
         else:
-            file = file.read()
+            if isinstance(file, io.IOBase) and file.seekable():
+                pos = file.tell()
+            else:
+                pos = None
+
+            # TODO Don't load the entire file in memory always
+            data = file.read()
+            if pos is not None:
+                file.seek(pos)
+
+            file = data
             file_size = len(file)
 
         # File will now either be a string or bytes
@@ -469,14 +515,15 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
             self, file, force_document=False,
             progress_callback=None, attributes=None, thumb=None,
             allow_cache=True, voice_note=False, video_note=False,
-            supports_streaming=False):
+            supports_streaming=False, mime_type=None, as_image=None):
         if not file:
-            return None, None
+            return None, None, None
 
         if isinstance(file, pathlib.Path):
             file = str(file.absolute())
 
-        as_image = utils.is_image(file) and not force_document
+        if as_image is None:
+            as_image = utils.is_image(file) and not force_document
 
         if not isinstance(file, (str, bytes, io.IOBase)):
             # The user may pass a Message containing media (or the media,
@@ -494,9 +541,10 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
                     voice_note=voice_note,
                     video_note=video_note,
                     supports_streaming=supports_streaming
-                ))
+                ), as_image)
             except TypeError:
-                return None, None  # Can't turn whatever was given into media
+                # Can't turn whatever was given into media
+                return None, None, as_image
 
         media = None
         file_handle = None
@@ -537,6 +585,7 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
         else:
             attributes, mime_type = utils.get_attributes(
                 file,
+                mime_type=mime_type,
                 attributes=attributes,
                 force_document=force_document,
                 voice_note=voice_note,
@@ -556,16 +605,15 @@ class UploadMethods(ButtonMethods, MessageParseMethods, UserMethods):
                 attributes=attributes,
                 **input_kw
             )
-        return file_handle, media
+        return file_handle, media, as_image
 
-    async def _cache_media(self, msg, file, file_handle,
-                           force_document=False):
+    async def _cache_media(self, msg, file, file_handle, image):
         if file and msg and isinstance(file_handle,
                                        custom.InputSizedFile):
             # There was a response message and we didn't use cached
             # version, so cache whatever we just sent to the database.
             md5, size = file_handle.md5, file_handle.size
-            if utils.is_image(file) and not force_document:
+            if image:
                 to_cache = utils.get_input_photo(msg.media.photo)
             else:
                 to_cache = utils.get_input_document(msg.media.document)

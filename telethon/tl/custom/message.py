@@ -183,6 +183,8 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         self._sender_id = from_id
         self._sender = None
         self._input_sender = None
+        self._via_bot = None
+        self._via_input_bot = None
         self._action_entities = None
 
         if not out and isinstance(to_id, types.PeerUser):
@@ -208,20 +210,20 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         known entities.
         """
         self._client = client
-        self._sender = entities.get(self._sender_id)
-        if self._sender:
-            try:
-                self._input_sender = utils.get_input_peer(self._sender)
-            except TypeError:
-                self._input_sender = None
+        cache = client._entity_cache
 
-        self._chat = entities.get(self.chat_id)
-        self._input_chat = input_chat
-        if not self._input_chat and self._chat:
-            try:
-                self._input_chat = utils.get_input_peer(self._chat)
-            except TypeError:
-                self._input_chat = None
+        self._sender, self._input_sender = utils._get_entity_pair(
+            self.sender_id, entities, cache)
+
+        self._chat, self._input_chat = utils._get_entity_pair(
+            self.chat_id, entities, cache)
+
+        if input_chat:  # This has priority
+            self._input_chat = input_chat
+
+        if self.via_bot_id:
+            self._via_bot, self._via_input_bot = utils._get_entity_pair(
+                self.via_bot_id, entities, cache)
 
         if self.fwd_from:
             self._forward = Forward(self._client, self.fwd_from, entities)
@@ -530,6 +532,24 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         """
         return self._action_entities
 
+    @property
+    def via_bot(self):
+        """
+        If this message was sent via some bot (i.e. `via_bot_id` is not
+        ``None``), this property returns the :tl:`User` of the bot that
+        was used to send this message.
+
+        Returns ``None`` otherwise (or if the bot entity is unknown).
+        """
+        return self._via_bot
+
+    @property
+    def via_input_bot(self):
+        """
+        Returns the input variant of `via_bot`.
+        """
+        return self._via_input_bot
+
     # endregion Public Properties
 
     # region Public Methods
@@ -566,7 +586,7 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
 
         The result will be cached after its first use.
         """
-        if self._reply_message is None:
+        if self._reply_message is None and self._client:
             if not self.reply_to_msg_id:
                 return None
 
@@ -594,8 +614,9 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         `telethon.client.messages.MessageMethods.send_message`
         with ``entity`` already set.
         """
-        return await self._client.send_message(
-            await self.get_input_chat(), *args, **kwargs)
+        if self._client:
+            return await self._client.send_message(
+                await self.get_input_chat(), *args, **kwargs)
 
     async def reply(self, *args, **kwargs):
         """
@@ -603,9 +624,10 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         `telethon.client.messages.MessageMethods.send_message`
         with both ``entity`` and ``reply_to`` already set.
         """
-        kwargs['reply_to'] = self.id
-        return await self._client.send_message(
-            await self.get_input_chat(), *args, **kwargs)
+        if self._client:
+            kwargs['reply_to'] = self.id
+            return await self._client.send_message(
+                await self.get_input_chat(), *args, **kwargs)
 
     async def forward_to(self, *args, **kwargs):
         """
@@ -617,9 +639,10 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         this `forward_to` method. Use a
         `telethon.client.telegramclient.TelegramClient` instance directly.
         """
-        kwargs['messages'] = self.id
-        kwargs['from_peer'] = await self.get_input_chat()
-        return await self._client.forward_messages(*args, **kwargs)
+        if self._client:
+            kwargs['messages'] = self.id
+            kwargs['from_peer'] = await self.get_input_chat()
+            return await self._client.forward_messages(*args, **kwargs)
 
     async def edit(self, *args, **kwargs):
         """
@@ -642,7 +665,7 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
             This is generally the most desired and convenient behaviour,
             and will work for link previews and message buttons.
         """
-        if self.fwd_from or not self.out:
+        if self.fwd_from or not self.out or not self._client:
             return None  # We assume self.out was patched for our chat
 
         if 'link_preview' not in kwargs:
@@ -668,10 +691,11 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         this `delete` method. Use a
         `telethon.client.telegramclient.TelegramClient` instance directly.
         """
-        return await self._client.delete_messages(
-            await self.get_input_chat(), [self.id],
-            *args, **kwargs
-        )
+        if self._client:
+            return await self._client.delete_messages(
+                await self.get_input_chat(), [self.id],
+                *args, **kwargs
+            )
 
     async def download_media(self, *args, **kwargs):
         """
@@ -679,7 +703,8 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         for `telethon.client.downloads.DownloadMethods.download_media`
         with the ``message`` already set.
         """
-        return await self._client.download_media(self, *args, **kwargs)
+        if self._client:
+            return await self._client.download_media(self, *args, **kwargs)
 
     async def click(self, i=None, j=None,
                     *, text=None, filter=None, data=None):
@@ -730,6 +755,9 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
                 that if the message does not have this data, it will
                 ``raise DataInvalidError``.
         """
+        if not self._client:
+            return
+
         if data:
             if not await self.get_input_chat():
                 return None
@@ -779,12 +807,14 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
 
     # region Private Methods
 
-    # TODO Make a property for via_bot and via_input_bot, as well as get_*
     async def _reload_message(self):
         """
         Re-fetches this message to reload the sender and chat entities,
         along with their input versions.
         """
+        if not self._client:
+            return
+
         try:
             chat = await self.get_input_chat() if self.is_channel else None
             msg = await self._client.get_messages(chat, ids=self.id)
@@ -797,6 +827,9 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         self._input_sender = msg._input_sender
         self._chat = msg._chat
         self._input_chat = msg._input_chat
+        self._via_bot = msg._via_bot
+        self._via_input_bot = msg._via_input_bot
+        self._forward = msg._forward
         self._action_entities = msg._action_entities
 
     async def _refetch_sender(self):
@@ -806,7 +839,7 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         """
         Helper methods to set the buttons given the input sender and chat.
         """
-        if isinstance(self.reply_markup, (
+        if self._client and isinstance(self.reply_markup, (
                 types.ReplyInlineMarkup, types.ReplyKeyboardMarkup)):
             self._buttons = [[
                 MessageButton(self._client, button, chat, bot, self.id)
@@ -822,7 +855,7 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
         to know what bot we want to start. Raises ``ValueError`` if the bot
         cannot be found but is needed. Returns ``None`` if it's not needed.
         """
-        if not isinstance(self.reply_markup, (
+        if self._client and  not isinstance(self.reply_markup, (
                 types.ReplyInlineMarkup, types.ReplyKeyboardMarkup)):
             return None
 
@@ -834,8 +867,10 @@ class Message(ChatGetter, SenderGetter, TLObject, abc.ABC):
                         if not bot:
                             raise ValueError('No input sender')
                     else:
-                        return self._client.session.get_input_entity(
-                            self.via_bot_id)
+                        try:
+                            return self._client._entity_cache[self.via_bot_id]
+                        except KeyError:
+                            raise ValueError('No input sender') from None
 
     def _document_by_attribute(self, kind, condition=None):
         """
