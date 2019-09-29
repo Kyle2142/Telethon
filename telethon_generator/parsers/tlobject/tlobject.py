@@ -14,7 +14,7 @@ WHITELISTED_MISMATCHING_IDS = {
 
 class TLObject:
     def __init__(self, fullname, object_id, args, result,
-                 is_function, usability, layer):
+                 is_function, usability, friendly, layer):
         """
         Initializes a new TLObject, given its properties.
 
@@ -25,6 +25,7 @@ class TLObject:
         :param result: The result type of the TL object
         :param is_function: Is the object a function or a type?
         :param usability: The usability for this method.
+        :param friendly: A tuple (namespace, friendly method name) if known.
         :param layer: The layer this TLObject belongs to.
         """
         # The name can or not have a namespace
@@ -38,6 +39,7 @@ class TLObject:
         self.result = result
         self.is_function = is_function
         self.usability = usability
+        self.friendly = friendly
         self.id = None
         if object_id is None:
             self.id = self.infer_id()
@@ -55,6 +57,14 @@ class TLObject:
 
         self.real_args = list(a for a in self.sorted_args() if not
                               (a.flag_indicator or a.generic_definition))
+
+    @property
+    def innermost_result(self):
+        index = self.result.find('<')
+        if index == -1:
+            return self.result
+        else:
+            return self.result[index + 1:-1]
 
     def sorted_args(self):
         """Returns the arguments properly sorted and ready to plug-in

@@ -2,6 +2,7 @@ import base64
 import ipaddress
 import struct
 
+from .abstract import Session
 from .memory import MemorySession
 from ..crypto import AuthKey
 
@@ -25,10 +26,7 @@ class StringSession(MemorySession):
     * `encode` definition must be ``def encode(value: bytes) -> str:``.
     * `decode` definition must be ``def decode(value: str) -> bytes:``.
     """
-    encode = lambda x: base64.urlsafe_b64encode(x).decode('ascii')
-    decode = base64.urlsafe_b64decode
-
-    def __init__(self, string=None):
+    def __init__(self, string: str = None):
         super().__init__()
         if string:
             if string[0] != CURRENT_VERSION:
@@ -43,15 +41,23 @@ class StringSession(MemorySession):
             if any(key):
                 self._auth_key = AuthKey(key)
 
-    def save(self):
-        if not self._auth_key:
+    @staticmethod
+    def encode(x: bytes) -> str:
+        return base64.urlsafe_b64encode(x).decode('ascii')
+
+    @staticmethod
+    def decode(x: str) -> bytes:
+        return base64.urlsafe_b64decode(x)
+
+    def save(self: Session):
+        if not self.auth_key:
             return ''
 
-        ip = ipaddress.ip_address(self._server_address).packed
+        ip = ipaddress.ip_address(self.server_address).packed
         return CURRENT_VERSION + StringSession.encode(struct.pack(
             _STRUCT_PREFORMAT.format(len(ip)),
-            self._dc_id,
+            self.dc_id,
             ip,
-            self._port,
-            self._auth_key.key
+            self.port,
+            self.auth_key.key
         ))

@@ -1,16 +1,18 @@
 import abc
 import asyncio
+import collections
 import logging
 import platform
-import sys
 import time
-from datetime import datetime, timezone
+import typing
 
-from .. import version, __name__ as __base_name__
+from .. import version, helpers, __name__ as __base_name__
 from ..crypto import rsa
+from ..entitycache import EntityCache
 from ..extensions import markdown
-from ..network import MTProtoSender, ConnectionTcpFull, ConnectionTcpMTProxy
+from ..network import MTProtoSender, Connection, ConnectionTcpFull, TcpMTProxy
 from ..sessions import Session, SQLiteSession, MemorySession
+from ..statecache import StateCache
 from ..tl import TLObject, functions, types
 from ..tl.alltlobjects import LAYER
 
@@ -19,21 +21,25 @@ DEFAULT_IPV4_IP = '149.154.167.51'
 DEFAULT_IPV6_IP = '[2001:67c:4e8:f002::a]'
 DEFAULT_PORT = 443
 
+if typing.TYPE_CHECKING:
+    from .telegramclient import TelegramClient
+
 __default_log__ = logging.getLogger(__base_name__)
 __default_log__.addHandler(logging.NullHandler())
 
 
+# TODO How hard would it be to support both `trio` and `asyncio`?
 class TelegramBaseClient(abc.ABC):
     """
     This is the abstract base class for the client. It defines some
     basic stuff like connecting, switching data center, etc, and
     leaves the `__call__` unimplemented.
 
-    Args:
+    Arguments
         session (`str` | `telethon.sessions.abstract.Session`, `None`):
             The file name of the session file to be used if a string is
             given (it may be a full path), or the Session instance to be
-            used otherwise. If it's ``None``, the session will not be saved,
+            used otherwise. If it's `None`, the session will not be saved,
             and you should call :meth:`.log_out()` when you're done.
 
             Note that if you pass a string it will be a file in the current
@@ -58,12 +64,12 @@ class TelegramBaseClient(abc.ABC):
 
         use_ipv6 (`bool`, optional):
             Whether to connect to the servers through IPv6 or not.
-            By default this is ``False`` as IPv6 support is not
+            By default this is `False` as IPv6 support is not
             too widespread yet.
 
         proxy (`tuple` | `list` | `dict`, optional):
             An iterable consisting of the proxy info. If `connection` is
-            `ConnectionTcpMTProxy`, then it should contain MTProxy credentials:
+            one of `MTProxy`, then it should contain MTProxy credentials:
             ``('hostname', port, 'secret')``. Otherwise, it's meant to store
             function parameters for PySocks, like ``(type, 'hostname', port)``.
             See https://github.com/Anorov/PySocks#usage-1 for more.
@@ -81,14 +87,14 @@ class TelegramBaseClient(abc.ABC):
             when there is a ``errors.FloodWaitError`` less than
             `flood_sleep_threshold`, or when there's a migrate error.
 
-            May take a negative or ``None`` value for infinite retries, but
+            May take a negative or `None` value for infinite retries, but
             this is not recommended, since some requests can always trigger
             a call fail (such as searching for messages).
 
         connection_retries (`int` | `None`, optional):
             How many times the reconnection should retry, either on the
             initial connection or when Telegram disconnects us. May be
-            set to a negative or ``None`` value for infinite retries, but
+            set to a negative or `None` value for infinite retries, but
             this is not recommended, since the program can get stuck in an
             infinite loop.
 
@@ -105,14 +111,14 @@ class TelegramBaseClient(abc.ABC):
             the order in which updates are processed to be sequential, and
             this setting allows them to do so.
 
-            If set to ``True``, incoming updates will be put in a queue
+            If set to `True`, incoming updates will be put in a queue
             and processed sequentially. This means your event handlers
             should *not* perform long-running operations since new
             updates are put inside of an unbounded queue.
 
         flood_sleep_threshold (`int` | `float`, optional):
             The threshold below which the library should automatically
-            sleep on flood wait errors (inclusive). For instance, if a
+            sleep on flood wait and slow mode wait errors (inclusive). For instance, if a
             ``FloodWaitError`` for 17s occurs and `flood_sleep_threshold`
             is 20s, the library will ``sleep`` automatically. If the error
             was for 21s, it would ``raise FloodWaitError`` instead. Values
@@ -157,25 +163,29 @@ class TelegramBaseClient(abc.ABC):
 
     # region Initialization
 
-    def __init__(self, session, api_id, api_hash,
-                 *,
-                 connection=ConnectionTcpFull,
-                 use_ipv6=False,
-                 proxy=None,
-                 timeout=10,
-                 request_retries=5,
-                 connection_retries=5,
-                 retry_delay=1,
-                 auto_reconnect=True,
-                 sequential_updates=False,
-                 flood_sleep_threshold=60,
-                 device_model=None,
-                 system_version=None,
-                 app_version=None,
-                 lang_code='en',
-                 system_lang_code='en',
-                 loop=None,
-                 base_logger=None):
+    def __init__(
+            self: 'TelegramClient',
+            session: 'typing.Union[str, Session]',
+            api_id: int,
+            api_hash: str,
+            *,
+            connection: 'typing.Type[Connection]' = ConnectionTcpFull,
+            use_ipv6: bool = False,
+            proxy: typing.Union[tuple, dict] = None,
+            timeout: int = 10,
+            request_retries: int = 5,
+            connection_retries: int =5,
+            retry_delay: int = 1,
+            auto_reconnect: bool = True,
+            sequential_updates: bool = False,
+            flood_sleep_threshold: int = 60,
+            device_model: str = None,
+            system_version: str = None,
+            app_version: str = None,
+            lang_code: str = 'en',
+            system_lang_code: str = 'en',
+            loop: asyncio.AbstractEventLoop = None,
+            base_logger: typing.Union[str, logging.Logger] = None):
         if not api_id or not api_hash:
             raise ValueError(
                 "Your API ID or Hash cannot be empty or None. "
@@ -228,14 +238,16 @@ class TelegramBaseClient(abc.ABC):
 
         self.flood_sleep_threshold = flood_sleep_threshold
 
-        # TODO Figure out how to use AsyncClassWrapper(session)
-        # The problem is that ChatGetter and SenderGetter rely
-        # on synchronous calls to session.get_entity precisely
-        # to avoid network access and the need for await.
+        # TODO Use AsyncClassWrapper(session)
+        # ChatGetter and SenderGetter can use the in-memory _entity_cache
+        # to avoid network access and the need for await in session files.
         #
-        # With asynchronous sessions, it would need await,
-        # and defeats the purpose of properties.
+        # The session files only wants the entities to persist
+        # them to disk, and to save additional useful information.
+        # TODO Session should probably return all cached
+        #      info of entities, not just the input versions
         self.session = session
+        self._entity_cache = EntityCache()
         self.api_id = int(api_id)
         self.api_hash = api_hash
 
@@ -248,8 +260,8 @@ class TelegramBaseClient(abc.ABC):
 
         assert isinstance(connection, type)
         self._connection = connection
-        init_proxy = None if connection is not ConnectionTcpMTProxy else \
-            types.InputClientProxy(*ConnectionTcpMTProxy.address_info(proxy))
+        init_proxy = None if not issubclass(connection, TcpMTProxy) else \
+            types.InputClientProxy(*connection.address_info(proxy))
 
         # Used on connection. Capture the variables in a lambda since
         # exporting clients need to create this InvokeWithLayerRequest.
@@ -297,19 +309,23 @@ class TelegramBaseClient(abc.ABC):
             self._updates_queue = asyncio.Queue(loop=self._loop)
             self._dispatching_updates_queue = asyncio.Event(loop=self._loop)
         else:
-            self._updates_queue = None
+            # Use a set of pending instead of a queue so we can properly
+            # terminate all pending updates on disconnect.
+            self._updates_queue = set()
             self._dispatching_updates_queue = None
 
         self._authorized = None  # None = unknown, False = no, True = yes
-        self._state = self.session.get_update_state(0)
-        if not self._state:
-            self._state = types.updates.State(
-                0, 0, datetime.now(tz=timezone.utc), 0, 0)
+
+        # Update state (for catching up after a disconnection)
+        # TODO Get state from channels too
+        self._state_cache = StateCache(
+            self.session.get_update_state(0), self._log)
 
         # Some further state for subclasses
         self._event_builders = []
-        self._conversations = {}
-        self._ids_in_conversations = {}  # chat_id: count
+
+        # {chat_id: {Conversation}}
+        self._conversations = collections.defaultdict(set)
 
         # Default parse mode
         self._parse_mode = markdown
@@ -329,14 +345,37 @@ class TelegramBaseClient(abc.ABC):
     # region Properties
 
     @property
-    def loop(self):
+    def loop(self: 'TelegramClient') -> asyncio.AbstractEventLoop:
+        """
+        Property with the ``asyncio`` event loop used by this client.
+
+        Example
+            .. code-block:: python
+
+                # Download media in the background
+                task = client.loop_create_task(message.download_media())
+
+                # Do some work
+                ...
+
+                # Join the task (wait for it to complete)
+                await task
+        """
         return self._loop
 
     @property
-    def disconnected(self):
+    def disconnected(self: 'TelegramClient') -> asyncio.Future:
         """
-        Future that resolves when the connection to Telegram
-        ends, either by user action or in the background.
+        Property with a ``Future`` that resolves upon disconnection.
+
+        Example
+            .. code-block:: python
+
+                # Wait for a disconnection to occur
+                try:
+                    await client.disconnected
+                except OSError:
+                    print('Error on disconnect')
         """
         return self._sender.disconnected
 
@@ -344,18 +383,39 @@ class TelegramBaseClient(abc.ABC):
 
     # region Connecting
 
-    async def connect(self):
+    async def connect(self: 'TelegramClient') -> None:
         """
         Connects to Telegram.
+
+        .. note::
+
+            Connect means connect and nothing else, and only one low-level
+            request is made to notify Telegram about which layer we will be
+            using.
+
+            Before Telegram sends you updates, you need to make a high-level
+            request, like `client.get_me() <telethon.client.users.UserMethods.get_me>`,
+            as described in https://core.telegram.org/api/updates.
+
+        Example
+            .. code-block:: python
+
+                try:
+                    await client.connect()
+                except OSError:
+                    print('Failed to connect')
         """
-        await self._sender.connect(self._connection(
+        if not await self._sender.connect(self._connection(
             self.session.server_address,
             self.session.port,
             self.session.dc_id,
             loop=self._loop,
             loggers=self._log,
             proxy=self._proxy
-        ))
+        )):
+            # We don't want to init or modify anything if we were already connected
+            return
+
         self.session.auth_key = self._sender.auth_key
         self.session.save()
 
@@ -364,63 +424,84 @@ class TelegramBaseClient(abc.ABC):
 
         self._updates_handle = self._loop.create_task(self._update_loop())
 
-    def is_connected(self):
+    def is_connected(self: 'TelegramClient') -> bool:
         """
-        Returns ``True`` if the user has connected.
+        Returns `True` if the user has connected.
+
+        This method is **not** asynchronous (don't use ``await`` on it).
+
+        Example
+            .. code-block:: python
+
+                while client.is_connected():
+                    await asyncio.sleep(1)
         """
         sender = getattr(self, '_sender', None)
         return sender and sender.is_connected()
 
-    def disconnect(self):
+    def disconnect(self: 'TelegramClient'):
         """
         Disconnects from Telegram.
 
-        Returns a dummy completed future with ``None`` as a result so
-        you can ``await`` this method just like every other method for
-        consistency or compatibility.
+        If the event loop is already running, this method returns a
+        coroutine that you should await on your own code; otherwise
+        the loop is ran until said coroutine completes.
+
+        Example
+            .. code-block:: python
+
+                # You don't need to use this if you used "with client"
+                await client.disconnect()
         """
-        self._disconnect()
-        if getattr(self, 'session', None):
-            if getattr(self, '_state', None):
-                self.session.set_update_state(0, self._state)
-            self.session.close()
+        if self._loop.is_running():
+            return self._disconnect_coro()
+        else:
+            try:
+                self._loop.run_until_complete(self._disconnect_coro())
+            except RuntimeError:
+                # Python 3.5.x complains when called from
+                # `__aexit__` and there were pending updates with:
+                #   "Event loop stopped before Future completed."
+                #
+                # However, it doesn't really make a lot of sense.
+                pass
 
-        result = self._loop.create_future()
-        result.set_result(None)
-        return result
+    async def _disconnect_coro(self: 'TelegramClient'):
+        await self._disconnect()
 
-    def _disconnect(self):
+        # trio's nurseries would handle this for us, but this is asyncio.
+        # All tasks spawned in the background should properly be terminated.
+        if self._dispatching_updates_queue is None and self._updates_queue:
+            for task in self._updates_queue:
+                task.cancel()
+
+            await asyncio.wait(self._updates_queue, loop=self._loop)
+            self._updates_queue.clear()
+
+        pts, date = self._state_cache[None]
+        if pts and date:
+            self.session.set_update_state(0, types.updates.State(
+                pts=pts,
+                qts=0,
+                date=date,
+                seq=0,
+                unread_count=0
+            ))
+
+        self.session.close()
+
+    async def _disconnect(self: 'TelegramClient'):
         """
         Disconnect only, without closing the session. Used in reconnections
         to different data centers, where we don't want to close the session
         file; user disconnects however should close it since it means that
         their job with the client is complete and we should clean it up all.
         """
-        # All properties may be ``None`` if `__init__` fails, and this
-        # method will be called from `__del__` which would crash then.
-        if getattr(self, '_sender', None):
-            self._sender.disconnect()
-        if getattr(self, '_updates_handle', None):
-            self._updates_handle.cancel()
+        await self._sender.disconnect()
+        await helpers._cancel(self._log[__name__],
+                              updates_handle=self._updates_handle)
 
-    def __del__(self):
-        if not self.is_connected() or self.loop.is_closed():
-            return
-
-        # READ THIS IF DISCONNECT IS ASYNC AND A TASK WOULD BE MADE.
-        # Python 3.5.2's ``asyncio`` mod seems to have a bug where it's not
-        # able to close the pending tasks properly, and letting the script
-        # complete without calling disconnect causes the script to trigger
-        # 100% CPU load. Call disconnect to make sure it doesn't happen.
-        try:
-            self.disconnect()
-        except Exception:
-            # Arguably not the best solution, but worth trying if the user
-            # forgot to disconnect; normally this is fine but sometimes it
-            # can fail (https://github.com/LonamiWebs/Telethon/issues/1073)
-            pass
-
-    async def _switch_dc(self, new_dc):
+    async def _switch_dc(self: 'TelegramClient', new_dc):
         """
         Permanently switches the current connection to the new data center.
         """
@@ -433,10 +514,10 @@ class TelegramBaseClient(abc.ABC):
         self._sender.auth_key.key = None
         self.session.auth_key = None
         self.session.save()
-        self._disconnect()
+        await self._disconnect()
         return await self.connect()
 
-    def _auth_key_callback(self, auth_key):
+    def _auth_key_callback(self: 'TelegramClient', auth_key):
         """
         Callback from the sender whenever it needed to generate a
         new authorization key. This means we are not authorized.
@@ -448,7 +529,7 @@ class TelegramBaseClient(abc.ABC):
 
     # region Working with different connections/Data Centers
 
-    async def _get_dc(self, dc_id, cdn=False):
+    async def _get_dc(self: 'TelegramClient', dc_id, cdn=False):
         """Gets the Data Center (DC) associated to 'dc_id'"""
         cls = self.__class__
         if not cls._config:
@@ -465,7 +546,7 @@ class TelegramBaseClient(abc.ABC):
             and bool(dc.ipv6) == self._use_ipv6 and bool(dc.cdn) == cdn
         )
 
-    async def _create_exported_sender(self, dc_id):
+    async def _create_exported_sender(self: 'TelegramClient', dc_id):
         """
         Creates a new exported `MTProtoSender` for the given `dc_id` and
         returns it. This method should be used by `_borrow_exported_sender`.
@@ -495,7 +576,7 @@ class TelegramBaseClient(abc.ABC):
         await sender.send(req)
         return sender
 
-    async def _borrow_exported_sender(self, dc_id):
+    async def _borrow_exported_sender(self: 'TelegramClient', dc_id):
         """
         Borrows a connected `MTProtoSender` for the given `dc_id`.
         If it's not cached, creates a new one if it doesn't exist yet,
@@ -523,7 +604,7 @@ class TelegramBaseClient(abc.ABC):
 
         return sender
 
-    async def _return_exported_sender(self, sender):
+    async def _return_exported_sender(self: 'TelegramClient', sender):
         """
         Returns a borrowed exported sender. If all borrows have
         been returned, the sender is cleanly disconnected.
@@ -536,9 +617,9 @@ class TelegramBaseClient(abc.ABC):
             if not n:
                 self._log[__name__].info(
                     'Disconnecting borrowed sender for DC %d', dc_id)
-                sender.disconnect()
+                await sender.disconnect()
 
-    async def _get_cdn_client(self, cdn_redirect):
+    async def _get_cdn_client(self: 'TelegramClient', cdn_redirect):
         """Similar to ._borrow_exported_client, but for CDNs"""
         # TODO Implement
         raise NotImplementedError
@@ -569,7 +650,7 @@ class TelegramBaseClient(abc.ABC):
     # region Invoking Telegram requests
 
     @abc.abstractmethod
-    def __call__(self, request, ordered=False):
+    def __call__(self: 'TelegramClient', request, ordered=False):
         """
         Invokes (sends) one or more MTProtoRequests and returns (receives)
         their result.
@@ -590,15 +671,15 @@ class TelegramBaseClient(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def _handle_update(self, update):
+    def _handle_update(self: 'TelegramClient', update):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def _update_loop(self):
+    def _update_loop(self: 'TelegramClient'):
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def _handle_auto_reconnect(self):
+    async def _handle_auto_reconnect(self: 'TelegramClient'):
         raise NotImplementedError
 
     # endregion

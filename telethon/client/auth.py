@@ -1,30 +1,36 @@
-import datetime
 import getpass
-import hashlib
 import inspect
 import os
 import sys
+import typing
 
-from .messageparse import MessageParseMethods
-from .users import UserMethods
 from .. import utils, helpers, errors, password as pwd_mod
 from ..tl import types, functions
 
+if typing.TYPE_CHECKING:
+    from .telegramclient import TelegramClient
 
-class AuthMethods(MessageParseMethods, UserMethods):
+
+class AuthMethods:
 
     # region Public methods
 
     def start(
-            self,
-            phone=lambda: input('Please enter your phone (or bot token): '),
-            password=lambda: getpass.getpass('Please enter your password: '),
+            self: 'TelegramClient',
+            phone: typing.Callable[[], str] = lambda: input('Please enter your phone (or bot token): '),
+            password: typing.Callable[[], str] = lambda: getpass.getpass('Please enter your password: '),
             *,
-            bot_token=None, force_sms=False, code_callback=None,
-            first_name='New User', last_name='', max_attempts=3):
+            bot_token: str = None,
+            force_sms: bool = False,
+            code_callback: typing.Callable[[], typing.Union[str, int]] = None,
+            first_name: str = 'New User',
+            last_name: str = '',
+            max_attempts: int = 3) -> 'TelegramClient':
         """
-        Convenience method to interactively connect and sign in if required,
-        also taking into consideration that 2FA may be enabled in the account.
+        Starts the client (connects and logs in if necessary).
+
+        By default, this method will be interactive (asking for
+        user input if needed), and will handle 2FA if enabled too.
 
         If the phone doesn't belong to an existing account (and will hence
         `sign_up` for a new one),  **you are agreeing to Telegram's
@@ -32,18 +38,11 @@ class AuthMethods(MessageParseMethods, UserMethods):
         will be banned otherwise.** See https://telegram.org/tos
         and https://core.telegram.org/api/terms.
 
-        Example usage:
-            >>> client = ...
-            >>> client.start(phone)
-            Please enter the code you received: 12345
-            Please enter your password: *******
-            (You are now logged in)
-
         If the event loop is already running, this method returns a
         coroutine that you should await on your own code; otherwise
         the loop is ran until said coroutine completes.
 
-        Args:
+        Arguments
             phone (`str` | `int` | `callable`):
                 The phone (or callable without arguments to get it)
                 to which the code will be sent. If a bot-token-like
@@ -80,9 +79,27 @@ class AuthMethods(MessageParseMethods, UserMethods):
                 How many times the code/password callback should be
                 retried or switching between signing in and signing up.
 
-        Returns:
+        Returns
             This `TelegramClient`, so initialization
             can be chained with ``.start()``.
+
+        Example
+            .. code-block:: python
+
+                client = TelegramClient('anon', api_id, api_hash)
+
+                # Starting as a bot account
+                await client.start(bot_token=bot_token)
+
+                # Starting as an user account
+                await client.start(phone)
+                # Please enter the code you received: 12345
+                # Please enter your password: *******
+                # (You are now logged in)
+
+                # Starting using a context manager (this calls start()):
+                with client:
+                    pass
         """
         if code_callback is None:
             def code_callback():
@@ -116,7 +133,7 @@ class AuthMethods(MessageParseMethods, UserMethods):
         )
 
     async def _start(
-            self, phone, password, bot_token, force_sms,
+            self: 'TelegramClient', phone, password, bot_token, force_sms,
             code_callback, first_name, last_name, max_attempts):
         if not self.is_connected():
             await self.connect()
@@ -146,8 +163,8 @@ class AuthMethods(MessageParseMethods, UserMethods):
         attempts = 0
         two_step_detected = False
 
-        sent_code = await self.send_code_request(phone, force_sms=force_sms)
-        sign_up = not sent_code.phone_registered
+        await self.send_code_request(phone, force_sms=force_sms)
+        sign_up = False  # assume login
         while attempts < max_attempts:
             try:
                 value = code_callback()
@@ -206,7 +223,7 @@ class AuthMethods(MessageParseMethods, UserMethods):
                         print('Invalid password. Please try again',
                               file=sys.stderr)
                 else:
-                    raise errors.PasswordHashInvalidError(None)
+                    raise errors.PasswordHashInvalidError(request=None)
             else:
                 me = await self.sign_in(phone=phone, password=password)
 
@@ -238,13 +255,25 @@ class AuthMethods(MessageParseMethods, UserMethods):
         return phone, phone_hash
 
     async def sign_in(
-            self, phone=None, code=None, *, password=None,
-            bot_token=None, phone_code_hash=None):
+            self: 'TelegramClient',
+            phone: str = None,
+            code: typing.Union[str, int] = None,
+            *,
+            password: str = None,
+            bot_token: str = None,
+            phone_code_hash: str = None) -> 'typing.Union[types.User, types.auth.SentCode]':
         """
-        Starts or completes the sign in process with the given phone number
-        or code that Telegram sent.
+        Logs in to Telegram to an existing user or bot account.
 
-        Args:
+        You should only use this if you are not authorized yet.
+
+        This method will send the code if it's not provided.
+
+        .. note::
+
+            In most cases, you should simply use `start()` and not this method.
+
+        Arguments
             phone (`str` | `int`):
                 The phone to send the code to if no code was provided,
                 or to override the phone that was previously used with
@@ -258,19 +287,29 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
             password (`str`):
                 2FA password, should be used if a previous call raised
-                SessionPasswordNeededError.
+                ``SessionPasswordNeededError``.
 
             bot_token (`str`):
                 Used to sign in as a bot. Not all requests will be available.
-                This should be the hash the @BotFather gave you.
+                This should be the hash the `@BotFather <https://t.me/BotFather>`_
+                gave you.
 
             phone_code_hash (`str`, optional):
                 The hash returned by `send_code_request`. This can be left as
-                ``None`` to use the last hash known for the phone to be used.
+                `None` to use the last hash known for the phone to be used.
 
-        Returns:
+        Returns
             The signed in user, or the information about
             :meth:`send_code_request`.
+
+        Example
+            .. code-block:: python
+
+                phone = '+34 123 123 123'
+                await client.sign_in(phone)  # send code
+
+                code = input('enter code: ')
+                await client.sign_in(phone, code)
         """
         me = await self.get_me()
         if me:
@@ -284,38 +323,54 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
             # May raise PhoneCodeEmptyError, PhoneCodeExpiredError,
             # PhoneCodeHashEmptyError or PhoneCodeInvalidError.
-            result = await self(functions.auth.SignInRequest(
-                phone, phone_code_hash, str(code)))
+            request = functions.auth.SignInRequest(
+                phone, phone_code_hash, str(code)
+            )
         elif password:
             pwd = await self(functions.account.GetPasswordRequest())
-            result = await self(functions.auth.CheckPasswordRequest(
+            request = functions.auth.CheckPasswordRequest(
                 pwd_mod.compute_check(pwd, password)
-            ))
+            )
         elif bot_token:
-            result = await self(functions.auth.ImportBotAuthorizationRequest(
+            request = functions.auth.ImportBotAuthorizationRequest(
                 flags=0, bot_auth_token=bot_token,
                 api_id=self.api_id, api_hash=self.api_hash
-            ))
+            )
         else:
             raise ValueError(
                 'You must provide a phone and a code the first time, '
                 'and a password only if an RPCError was raised before.'
             )
 
+        result = await self(request)
+        if isinstance(result, types.auth.AuthorizationSignUpRequired):
+            # Emulate pre-layer 104 behaviour
+            self._tos = result.terms_of_service
+            raise errors.PhoneNumberUnoccupiedError(request=request)
+
         return self._on_login(result.user)
 
-    async def sign_up(self, code, first_name, last_name='',
-                      *, phone=None, phone_code_hash=None):
+    async def sign_up(
+            self: 'TelegramClient',
+            code: typing.Union[str, int],
+            first_name: str,
+            last_name: str = '',
+            *,
+            phone: str = None,
+            phone_code_hash: str = None) -> 'types.User':
         """
-        Signs up to Telegram if you don't have an account yet.
-        You must call .send_code_request(phone) first.
+        Signs up to Telegram as a new user account.
+
+        Use this if you don't have an account yet.
+
+        You must call `send_code_request` first.
 
         **By using this method you're agreeing to Telegram's
         Terms of Service. This is required and your account
         will be banned otherwise.** See https://telegram.org/tos
         and https://core.telegram.org/api/terms.
 
-        Args:
+        Arguments
             code (`str` | `int`):
                 The code sent by Telegram
 
@@ -331,10 +386,19 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
             phone_code_hash (`str`, optional):
                 The hash returned by `send_code_request`. This can be left as
-                ``None`` to use the last hash known for the phone to be used.
+                `None` to use the last hash known for the phone to be used.
 
-        Returns:
+        Returns
             The new created :tl:`User`.
+
+        Example
+            .. code-block:: python
+
+                phone = '+34 123 123 123'
+                await client.send_code_request(phone)
+
+                code = input('enter code: ')
+                await client.sign_up(code, first_name='Anna', last_name='Banana')
         """
         me = await self.get_me()
         if me:
@@ -354,7 +418,6 @@ class AuthMethods(MessageParseMethods, UserMethods):
         result = await self(functions.auth.SignUpRequest(
             phone_number=phone,
             phone_code_hash=phone_code_hash,
-            phone_code=str(code),
             first_name=first_name,
             last_name=last_name
         ))
@@ -375,28 +438,39 @@ class AuthMethods(MessageParseMethods, UserMethods):
         self._self_input_peer = utils.get_input_peer(user, allow_self=False)
         self._authorized = True
 
-        # By setting state.pts = 1 after logging in, the user or bot can
-        # `catch_up` on all updates (and obtain necessary access hashes)
-        # if they desire. The date parameter is ignored when pts = 1.
-        self._state.pts = 1
-        self._state.date = datetime.datetime.now(tz=datetime.timezone.utc)
-
         return user
 
-    async def send_code_request(self, phone, *, force_sms=False):
+    async def send_code_request(
+            self: 'TelegramClient',
+            phone: str,
+            *,
+            force_sms: bool = False) -> 'types.auth.SentCode':
         """
-        Sends a code request to the specified phone number.
+        Sends the Telegram code needed to login to the given phone number.
 
-        Args:
+        Arguments
             phone (`str` | `int`):
                 The phone to which the code will be sent.
 
             force_sms (`bool`, optional):
                 Whether to force sending as SMS.
 
-        Returns:
+        Returns
             An instance of :tl:`SentCode`.
+
+        Example
+            .. code-block:: python
+
+                phone = '+34 123 123 123'
+                sent = await client.send_code_request(phone)
+                print(sent)
+
+                if sent.phone_registered:
+                    print('This phone has an existing account registered')
+                else:
+                    print('This phone does not have an account registered')
         """
+        result = None
         phone = utils.parse_phone(phone) or self._phone
         phone_hash = self._phone_code_hash.get(phone)
 
@@ -405,10 +479,15 @@ class AuthMethods(MessageParseMethods, UserMethods):
                 result = await self(functions.auth.SendCodeRequest(
                     phone, self.api_id, self.api_hash, types.CodeSettings()))
             except errors.AuthRestartError:
-                return self.send_code_request(phone, force_sms=force_sms)
+                return await self.send_code_request(phone, force_sms=force_sms)
 
-            self._tos = result.terms_of_service
-            self._phone_code_hash[phone] = phone_hash = result.phone_code_hash
+            # If we already sent a SMS, do not resend the code (hash may be empty)
+            if isinstance(result.type, types.auth.SentCodeTypeSms):
+                force_sms = False
+
+            # phone_code_hash may be empty, if it is, do not save it (#1283)
+            if result.phone_code_hash:
+                self._phone_code_hash[phone] = phone_hash = result.phone_code_hash
         else:
             force_sms = True
 
@@ -422,12 +501,18 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
         return result
 
-    async def log_out(self):
+    async def log_out(self: 'TelegramClient') -> bool:
         """
         Logs out Telegram and deletes the current ``*.session`` file.
 
-        Returns:
-            ``True`` if the operation was successful.
+        Returns
+            `True` if the operation was successful.
+
+        Example
+            .. code-block:: python
+
+                # Note: you will need to login again!
+                await client.log_out()
         """
         try:
             await self(functions.auth.LogOutRequest())
@@ -437,19 +522,24 @@ class AuthMethods(MessageParseMethods, UserMethods):
         self._bot = None
         self._self_input_peer = None
         self._authorized = False
-        self._state = types.updates.State(
-            0, 0, datetime.datetime.now(tz=datetime.timezone.utc), 0, 0)
+        self._state_cache.reset()
 
-        self.disconnect()
+        await self.disconnect()
         self.session.delete()
         return True
 
     async def edit_2fa(
-            self, current_password=None, new_password=None,
-            *, hint='', email=None, email_code_callback=None):
+            self: 'TelegramClient',
+            current_password: str = None,
+            new_password: str = None,
+            *,
+            hint: str = '',
+            email: str = None,
+            email_code_callback: typing.Callable[[int], str] = None) -> bool:
         """
-        Changes the 2FA settings of the logged in user, according to the
-        passed parameters. Take note of the parameter explanations.
+        Changes the 2FA settings of the logged in user.
+
+        Review carefully the parameter explanations before using this method.
 
         Note that this method may be *incredibly* slow depending on the
         prime numbers that must be used during the process to make sure
@@ -457,37 +547,47 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
         Has no effect if both current and new password are omitted.
 
-        current_password (`str`, optional):
-            The current password, to authorize changing to ``new_password``.
-            Must be set if changing existing 2FA settings.
-            Must **not** be set if 2FA is currently disabled.
-            Passing this by itself will remove 2FA (if correct).
+        Arguments
+            current_password (`str`, optional):
+                The current password, to authorize changing to ``new_password``.
+                Must be set if changing existing 2FA settings.
+                Must **not** be set if 2FA is currently disabled.
+                Passing this by itself will remove 2FA (if correct).
 
-        new_password (`str`, optional):
-            The password to set as 2FA.
-            If 2FA was already enabled, ``current_password`` **must** be set.
-            Leaving this blank or ``None`` will remove the password.
+            new_password (`str`, optional):
+                The password to set as 2FA.
+                If 2FA was already enabled, ``current_password`` **must** be set.
+                Leaving this blank or `None` will remove the password.
 
-        hint (`str`, optional):
-            Hint to be displayed by Telegram when it asks for 2FA.
-            Leaving unspecified is highly discouraged.
-            Has no effect if ``new_password`` is not set.
+            hint (`str`, optional):
+                Hint to be displayed by Telegram when it asks for 2FA.
+                Leaving unspecified is highly discouraged.
+                Has no effect if ``new_password`` is not set.
 
-        email (`str`, optional):
-            Recovery and verification email. If present, you must also
-            set `email_code_callback`, else it raises ``ValueError``.
+            email (`str`, optional):
+                Recovery and verification email. If present, you must also
+                set `email_code_callback`, else it raises ``ValueError``.
 
-        email_code_callback (`callable`, optional):
-            If an email is provided, a callback that returns the code sent
-            to it must also be set. This callback may be asynchronous.
-            It should return a string with the code. The length of the
-            code will be passed to the callback as an input parameter.
+            email_code_callback (`callable`, optional):
+                If an email is provided, a callback that returns the code sent
+                to it must also be set. This callback may be asynchronous.
+                It should return a string with the code. The length of the
+                code will be passed to the callback as an input parameter.
 
-            If the callback returns an invalid code, it will raise
-            ``CodeInvalidError``.
+                If the callback returns an invalid code, it will raise
+                ``CodeInvalidError``.
 
-        Returns:
-            ``True`` if successful, ``False`` otherwise.
+        Returns
+            `True` if successful, `False` otherwise.
+
+        Example
+            .. code-block:: python
+
+                # Setting a password for your account which didn't have
+                await client.edit_2fa(new_password='I_<3_Telethon')
+
+                # Removing the password
+                await client.edit_2fa(current_password='I_<3_Telethon')
         """
         if new_password is None and current_password is None:
             return False
@@ -537,22 +637,13 @@ class AuthMethods(MessageParseMethods, UserMethods):
 
     # region with blocks
 
-    def __enter__(self):
-        if self._loop.is_running():
-            raise RuntimeError(
-                'You must use "async with" if the event loop '
-                'is running (i.e. you are inside an "async def")'
-            )
-
-        return self.start()
-
     async def __aenter__(self):
         return await self.start()
 
-    def __exit__(self, *args):
-        self.disconnect()
-
     async def __aexit__(self, *args):
-        self.disconnect()
+        await self.disconnect()
+
+    __enter__ = helpers._sync_enter
+    __exit__ = helpers._sync_exit
 
     # endregion

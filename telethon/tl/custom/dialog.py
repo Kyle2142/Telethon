@@ -17,6 +17,12 @@ class Dialog:
         pinned (`bool`):
             Whether this dialog is pinned to the top or not.
 
+        folder_id (`folder_id`):
+            The folder ID that this dialog belongs to.
+
+        archived (`bool`):
+            Whether this dialog is archived or not (``folder_id is None``).
+
         message (`Message <telethon.tl.custom.message.Message>`):
             The last message sent on this dialog. Note that this member
             will not be updated when new messages arrive, it's only set
@@ -49,26 +55,28 @@ class Dialog:
             How many mentions are currently unread in this dialog. Note that
             this value won't update when new messages arrive.
 
-        draft (`telethon.tl.custom.draft.Draft`):
-            The draft object in this dialog. It will not be ``None``,
+        draft (`Draft <telethon.tl.custom.draft.Draft>`):
+            The draft object in this dialog. It will not be `None`,
             so you can call ``draft.set_message(...)``.
 
         is_user (`bool`):
-            ``True`` if the `entity` is a :tl:`User`.
+            `True` if the `entity` is a :tl:`User`.
 
         is_group (`bool`):
-            ``True`` if the `entity` is a :tl:`Chat`
+            `True` if the `entity` is a :tl:`Chat`
             or a :tl:`Channel` megagroup.
 
         is_channel (`bool`):
-            ``True`` if the `entity` is a :tl:`Channel`.
+            `True` if the `entity` is a :tl:`Channel`.
     """
-    def __init__(self, client, dialog, entities, messages):
+    def __init__(self, client, dialog, entities, message):
         # Both entities and messages being dicts {ID: item}
         self._client = client
         self.dialog = dialog
         self.pinned = bool(dialog.pinned)
-        self.message = messages.get(dialog.top_message, None)
+        self.folder_id = dialog.folder_id
+        self.archived = dialog.folder_id is not None
+        self.message = message
         self.date = getattr(self.message, 'date', None)
 
         self.entity = entities[utils.get_peer_id(dialog.peer)]
@@ -79,7 +87,7 @@ class Dialog:
         self.unread_count = dialog.unread_count
         self.unread_mentions_count = dialog.unread_mentions_count
 
-        self.draft = Draft._from_dialog(client, self)
+        self.draft = Draft(client, self.entity, self.dialog.draft)
 
         self.is_user = isinstance(self.entity, types.User)
         self.is_group = (
@@ -96,20 +104,42 @@ class Dialog:
         return await self._client.send_message(
             self.input_entity, *args, **kwargs)
 
-    async def delete(self):
+    async def delete(self, revoke=False):
         """
         Deletes the dialog from your dialog list. If you own the
         channel this won't destroy it, only delete it from the list.
+
+        Shorthand for `telethon.client.dialogs.DialogMethods.delete_dialog`
+        with ``entity`` already set.
         """
-        if self.is_channel:
-            await self._client(functions.channels.LeaveChannelRequest(
-                self.input_entity))
-        else:
-            if self.is_group:
-                await self._client(functions.messages.DeleteChatUserRequest(
-                    self.entity.id, types.InputPeerSelf()))
-            await self._client(functions.messages.DeleteHistoryRequest(
-                self.input_entity, 0))
+        await self._client.delete_dialog(self.input_entity, revoke=revoke)
+
+    async def archive(self, folder=1):
+        """
+        Archives (or un-archives) this dialog.
+
+        Args:
+            folder (`int`, optional):
+                The folder to which the dialog should be archived to.
+
+                If you want to "un-archive" it, use ``folder=0``.
+
+        Returns:
+            The :tl:`Updates` object that the request produces.
+
+        Example:
+
+            .. code-block:: python
+
+                # Archiving
+                dialog.archive()
+
+                # Un-archiving
+                dialog.archive(0)
+        """
+        return await self._client(functions.folders.EditPeerFoldersRequest([
+            types.InputFolderPeer(self.input_entity, folder_id=folder)
+        ]))
 
     def to_dict(self):
         return {

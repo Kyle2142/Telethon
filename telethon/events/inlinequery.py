@@ -12,7 +12,8 @@ from ..tl.custom.sendergetter import SenderGetter
 @name_inner_event
 class InlineQuery(EventBuilder):
     """
-    Represents an inline query event (when someone writes ``'@my_bot query'``).
+    Occurs whenever you sign in as a bot and a user
+    sends an inline query such as ``@bot query``.
 
     Args:
         users (`entity`, optional):
@@ -28,7 +29,7 @@ class InlineQuery(EventBuilder):
         pattern (`str`, `callable`, `Pattern`, optional):
             If set, only queries matching this pattern will be handled.
             You can specify a regex-like string which will be matched
-            against the message, a callable function that returns ``True``
+            against the message, a callable function that returns `True`
             if a message is acceptable, or a compiled regex pattern.
     """
     def __init__(
@@ -45,14 +46,9 @@ class InlineQuery(EventBuilder):
             raise TypeError('Invalid pattern type given')
 
     @classmethod
-    def build(cls, update):
+    def build(cls, update, others=None, self_id=None):
         if isinstance(update, types.UpdateBotInlineQuery):
-            event = cls.Event(update)
-        else:
-            return
-
-        event._entities = update._entities
-        return event
+            return cls.Event(update)
 
     def filter(self, event):
         if self.pattern:
@@ -80,12 +76,15 @@ class InlineQuery(EventBuilder):
         """
         def __init__(self, query):
             super().__init__(chat_peer=types.PeerUser(query.user_id))
+            SenderGetter.__init__(self, query.user_id)
             self.query = query
             self.pattern_match = None
             self._answered = False
-            self._sender_id = query.user_id
-            self._input_sender = None
-            self._sender = None
+
+        def _set_client(self, client):
+            super()._set_client(client)
+            self._sender, self._input_sender = utils._get_entity_pair(
+                self.sender_id, self._entities, client._entity_cache)
 
         @property
         def id(self):
@@ -173,6 +172,20 @@ class InlineQuery(EventBuilder):
                 switch_pm_param (`str`, optional):
                     Optional parameter to start the bot with if
                     `switch_pm` was used.
+
+            Example:
+
+                .. code-block:: python
+
+                    @bot.on(events.InlineQuery)
+                    async def handler(event):
+                        builder = event.builder
+
+                        rev_text = event.text[::-1]
+                        await event.answer([
+                            builder.article('Reverse text', text=rev_text),
+                            builder.photo('/path/to/photo.jpg')
+                        ])
             """
             if self._answered:
                 return

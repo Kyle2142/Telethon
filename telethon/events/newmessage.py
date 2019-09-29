@@ -8,15 +8,15 @@ from ..tl import types
 @name_inner_event
 class NewMessage(EventBuilder):
     """
-    Represents a new message event builder.
+    Occurs whenever a new text message or a message with media arrives.
 
     Args:
         incoming (`bool`, optional):
-            If set to ``True``, only **incoming** messages will be handled.
+            If set to `True`, only **incoming** messages will be handled.
             Mutually exclusive with ``outgoing`` (can only set one of either).
 
         outgoing (`bool`, optional):
-            If set to ``True``, only **outgoing** messages will be handled.
+            If set to `True`, only **outgoing** messages will be handled.
             Mutually exclusive with ``incoming`` (can only set one of either).
 
         from_users (`entity`, optional):
@@ -28,14 +28,14 @@ class NewMessage(EventBuilder):
 
         forwards (`bool`, optional):
             Whether forwarded messages should be handled or not. By default,
-            both forwarded and normal messages are included. If it's ``True``
-            *only* forwards will be handled. If it's ``False`` only messages
+            both forwarded and normal messages are included. If it's `True`
+            *only* forwards will be handled. If it's `False` only messages
             that are *not* forwards will be handled.
 
         pattern (`str`, `callable`, `Pattern`, optional):
             If set, only messages matching this pattern will be handled.
             You can specify a regex-like string which will be matched
-            against the message, a callable function that returns ``True``
+            against the message, a callable function that returns `True`
             if a message is acceptable, or a compiled regex pattern.
     """
     def __init__(self, chats=None, *, blacklist_chats=False, func=None,
@@ -49,7 +49,7 @@ class NewMessage(EventBuilder):
             incoming = not outgoing
         elif all(x is not None and not x for x in (incoming, outgoing)):
             raise ValueError("Don't create an event handler if you "
-                             "don't want neither incoming or outgoing!")
+                             "don't want neither incoming nor outgoing!")
 
         super().__init__(chats, blacklist_chats=blacklist_chats, func=func)
         self.incoming = incoming
@@ -76,7 +76,7 @@ class NewMessage(EventBuilder):
         self.from_users = await _into_id_set(client, self.from_users)
 
     @classmethod
-    def build(cls, update):
+    def build(cls, update, others=None, self_id=None):
         if isinstance(update,
                       (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
             if not isinstance(update.message, types.Message):
@@ -91,10 +91,8 @@ class NewMessage(EventBuilder):
                 id=update.id,
                 # Note that to_id/from_id complement each other in private
                 # messages, depending on whether the message was outgoing.
-                to_id=types.PeerUser(
-                    update.user_id if update.out else cls.self_id
-                ),
-                from_id=cls.self_id if update.out else update.user_id,
+                to_id=types.PeerUser(update.user_id if update.out else self_id),
+                from_id=self_id if update.out else update.user_id,
                 message=update.message,
                 date=update.date,
                 fwd_from=update.fwd_from,
@@ -128,7 +126,6 @@ class NewMessage(EventBuilder):
             if ori.from_id == ori.to_id.user_id and not ori.fwd_from:
                 event.message.out = True
 
-        event._entities = update._entities
         return event
 
     def filter(self, event):
@@ -158,18 +155,19 @@ class NewMessage(EventBuilder):
     class Event(EventCommon):
         """
         Represents the event of a new message. This event can be treated
-        to all effects as a `telethon.tl.custom.message.Message`, so please
-        **refer to its documentation** to know what you can do with this event.
+        to all effects as a `Message <telethon.tl.custom.message.Message>`,
+        so please **refer to its documentation** to know what you can do
+        with this event.
 
         Members:
             message (`Message <telethon.tl.custom.message.Message>`):
                 This is the only difference with the received
-                `telethon.tl.custom.message.Message`, and will
+                `Message <telethon.tl.custom.message.Message>`, and will
                 return the `telethon.tl.custom.message.Message` itself,
                 not the text.
 
-                See `telethon.tl.custom.message.Message` for the rest of
-                available members and methods.
+                See `Message <telethon.tl.custom.message.Message>` for
+                the rest of available members and methods.
 
             pattern_match (`obj`):
                 The resulting object from calling the passed ``pattern`` function.
@@ -181,7 +179,7 @@ class NewMessage(EventBuilder):
                 >>> @client.on(events.NewMessage(pattern=r'hi (\\w+)!'))
                 ... async def handler(event):
                 ...     # In this case, the result is a ``Match`` object
-                ...     # since the ``str`` pattern was converted into
+                ...     # since the `str` pattern was converted into
                 ...     # the ``re.compile(pattern).match`` function.
                 ...     print('Welcomed', event.pattern_match.group(1))
                 ...
@@ -204,7 +202,8 @@ class NewMessage(EventBuilder):
 
         def _set_client(self, client):
             super()._set_client(client)
-            self.message._finish_init(client, self._entities, None)
+            m = self.message
+            m._finish_init(client, self._entities, None)
             self.__dict__['_init'] = True  # No new attributes can be set
 
         def __getattr__(self, item):

@@ -1,6 +1,5 @@
 import asyncio
 import collections
-import functools
 
 from . import authenticator
 from ..extensions.messagepacker import MessagePacker
@@ -8,7 +7,7 @@ from .mtprotoplainsender import MTProtoPlainSender
 from .requeststate import RequestState
 from .mtprotostate import MTProtoState
 from ..tl.tlobject import TLRequest
-from .. import utils
+from .. import helpers, utils
 from ..errors import (
     BadMessageError, InvalidBufferError, SecurityError,
     TypeNotFoundError, rpc_message_to_error
@@ -23,23 +22,6 @@ from ..tl.types import (
 )
 from ..crypto import AuthKey
 from ..helpers import retry_range
-
-
-def _cancellable(func):
-    """
-    Silences `asyncio.CancelledError` for an entire function.
-
-    This way the function can be cancelled without the task ending
-    with a exception, and without the function body requiring another
-    indent level for the try/except.
-    """
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except asyncio.CancelledError:
-            pass
-    return wrapped
 
 
 class MTProtoSender:
@@ -72,6 +54,7 @@ class MTProtoSender:
         self._auth_key_callback = auth_key_callback
         self._update_callback = update_callback
         self._auto_reconnect_callback = auto_reconnect_callback
+        self._connect_lock = asyncio.Lock(loop=loop)
 
         # Whether the user has explicitly connected or disconnected.
         #
@@ -132,23 +115,25 @@ class MTProtoSender:
         """
         Connects to the specified given connection using the given auth key.
         """
-        if self._user_connected:
-            self._log.info('User is already connected!')
-            return
+        async with self._connect_lock:
+            if self._user_connected:
+                self._log.info('User is already connected!')
+                return False
 
-        self._connection = connection
-        await self._connect()
-        self._user_connected = True
+            self._connection = connection
+            await self._connect()
+            self._user_connected = True
+            return True
 
     def is_connected(self):
         return self._user_connected
 
-    def disconnect(self):
+    async def disconnect(self):
         """
         Cleanly disconnects the instance from the network, cancels
         all pending requests, and closes the send and receive loops.
         """
-        self._disconnect()
+        await self._disconnect()
 
     def send(self, request, ordered=False):
         """
@@ -214,17 +199,16 @@ class MTProtoSender:
         self._log.info('Connecting to %s...', self._connection)
         for attempt in retry_range(self._retries):
             try:
-                self._log.debug('Connection attempt {}...'.format(attempt))
+                self._log.debug('Connection attempt %d...', attempt)
                 await self._connection.connect(timeout=self._connect_timeout)
-            except (ConnectionError, asyncio.TimeoutError) as e:
-                self._log.warning('Attempt {} at connecting failed: {}: {}'
-                                  .format(attempt, type(e).__name__, e))
+            except (IOError, asyncio.TimeoutError) as e:
+                self._log.warning('Attempt %d at connecting failed: %s: %s',
+                                  attempt, type(e).__name__, e)
                 await asyncio.sleep(self._delay)
             else:
                 break
         else:
-            raise ConnectionError('Connection to Telegram failed {} time(s)'
-                                  .format(attempt))
+            raise ConnectionError('Connection to Telegram failed %d time(s)', attempt)
 
         self._log.debug('Connection success!')
         if not self.auth_key:
@@ -245,13 +229,11 @@ class MTProtoSender:
 
                     break
                 except (SecurityError, AssertionError) as e:
-                    self._log.warning('Attempt {} at new auth_key failed: {}'
-                                      .format(attempt, e))
+                    self._log.warning('Attempt %d at new auth_key failed: %s', attempt, e)
                     await asyncio.sleep(self._delay)
             else:
-                e = ConnectionError('auth_key generation failed {} time(s)'
-                                    .format(attempt))
-                self._disconnect(error=e)
+                e = ConnectionError('auth_key generation failed %d time(s)', attempt)
+                await self._disconnect(error=e)
                 raise e
 
         self._log.debug('Starting send loop')
@@ -268,15 +250,18 @@ class MTProtoSender:
 
         self._log.info('Connection to %s complete!', self._connection)
 
-    def _disconnect(self, error=None):
+    async def _disconnect(self, error=None):
+        if self._connection is None:
+            self._log.info('Not disconnecting (already have no connection)')
+            return
+
         self._log.info('Disconnecting from %s...', self._connection)
         self._user_connected = False
         try:
             self._log.debug('Closing current connection...')
-            self._connection.disconnect()
+            await self._connection.disconnect()
         finally:
-            self._log.debug('Cancelling {} pending message(s)...'
-                            .format(len(self._pending_state)))
+            self._log.debug('Cancelling %d pending message(s)...', len(self._pending_state))
             for state in self._pending_state.values():
                 if error and not state.future.done():
                     state.future.set_exception(error)
@@ -284,39 +269,39 @@ class MTProtoSender:
                     state.future.cancel()
 
             self._pending_state.clear()
-            self._pending_ack.clear()
-            self._last_ack = None
+            await helpers._cancel(
+                self._log,
+                send_loop_handle=self._send_loop_handle,
+                recv_loop_handle=self._recv_loop_handle
+            )
 
-            if self._send_loop_handle:
-                self._log.debug('Cancelling the send loop...')
-                self._send_loop_handle.cancel()
+            self._log.info('Disconnection from %s complete!', self._connection)
+            self._connection = None
 
-            if self._recv_loop_handle:
-                self._log.debug('Cancelling the receive loop...')
-                self._recv_loop_handle.cancel()
-
-        self._log.info('Disconnection from %s complete!', self._connection)
         if self._disconnected and not self._disconnected.done():
             if error:
                 self._disconnected.set_exception(error)
             else:
                 self._disconnected.set_result(None)
 
-    async def _reconnect(self):
+    async def _reconnect(self, last_error):
         """
         Cleanly disconnects and then reconnects.
         """
-        self._reconnecting = True
-
         self._log.debug('Closing current connection...')
-        self._connection.disconnect()
+        await self._connection.disconnect()
 
-        self._log.debug('Cancelling the send loop...')
-        self._send_loop_handle.cancel()
+        await helpers._cancel(
+            self._log,
+            send_loop_handle=self._send_loop_handle,
+            recv_loop_handle=self._recv_loop_handle
+        )
 
-        self._log.debug('Cancelling the receive loop...')
-        self._recv_loop_handle.cancel()
-
+        # TODO See comment in `_start_reconnect`
+        # Perhaps this should be the last thing to do?
+        # But _connect() creates tasks which may run and,
+        # if they see that reconnecting is True, they will end.
+        # Perhaps that task creation should not belong in connect?
         self._reconnecting = False
 
         # Start with a clean state (and thus session ID) to avoid old msgs
@@ -326,14 +311,16 @@ class MTProtoSender:
         for attempt in retry_range(retries):
             try:
                 await self._connect()
-            except (ConnectionError, asyncio.TimeoutError) as e:
+            except (IOError, asyncio.TimeoutError) as e:
+                last_error = e
                 self._log.info('Failed reconnection attempt %d with %s',
-                             attempt, e.__class__.__name__)
+                               attempt, e.__class__.__name__)
 
                 await asyncio.sleep(self._delay)
-            except Exception:
+            except Exception as e:
+                last_error = e
                 self._log.exception('Unexpected exception reconnecting on '
-                                  'attempt %d', attempt)
+                                    'attempt %d', attempt)
 
                 await asyncio.sleep(self._delay)
             else:
@@ -345,18 +332,26 @@ class MTProtoSender:
 
                 break
         else:
-            self._log.error('Automatic reconnection failed {} time(s)'
-                            .format(attempt))
-            self._disconnect(error=ConnectionError())
+            self._log.error('Automatic reconnection failed %d time(s)', attempt)
+            await self._disconnect(error=last_error.with_traceback(None))
 
-    def _start_reconnect(self):
+    def _start_reconnect(self, error):
         """Starts a reconnection in the background."""
-        if self._user_connected:
-            self._loop.create_task(self._reconnect())
+        if self._user_connected and not self._reconnecting:
+            # We set reconnecting to True here and not inside the new task
+            # because it may happen that send/recv loop calls this again
+            # while the new task hasn't had a chance to run yet. This race
+            # condition puts `self.connection` in a bad state with two calls
+            # to its `connect` without disconnecting, so it creates a second
+            # receive loop. There can't be two tasks receiving data from
+            # the reader, since that causes an error, and the library just
+            # gets stuck.
+            # TODO It still gets stuck? Investigate where and why.
+            self._reconnecting = True
+            self._loop.create_task(self._reconnect(error))
 
     # Loops
 
-    @_cancellable
     async def _send_loop(self):
         """
         This loop is responsible for popping items off the send
@@ -381,14 +376,14 @@ class MTProtoSender:
                 continue
 
             self._log.debug('Encrypting %d message(s) in %d bytes for sending',
-                          len(batch), len(data))
+                            len(batch), len(data))
 
             data = self._state.encrypt_message_data(data)
             try:
                 await self._connection.send(data)
-            except ConnectionError:
+            except IOError as e:
                 self._log.info('Connection closed while sending data')
-                self._start_reconnect()
+                self._start_reconnect(e)
                 return
 
             for state in batch:
@@ -402,7 +397,6 @@ class MTProtoSender:
 
             self._log.debug('Encrypted messages put in a queue to be sent')
 
-    @_cancellable
     async def _recv_loop(self):
         """
         This loop is responsible for reading all incoming responses
@@ -414,9 +408,9 @@ class MTProtoSender:
             self._log.debug('Receiving items from the network...')
             try:
                 body = await self._connection.recv()
-            except ConnectionError:
+            except IOError as e:
                 self._log.info('Connection closed while receiving data')
-                self._start_reconnect()
+                self._start_reconnect(e)
                 return
 
             try:
@@ -424,13 +418,13 @@ class MTProtoSender:
             except TypeNotFoundError as e:
                 # Received object which we don't know how to deserialize
                 self._log.info('Type %08x not found, remaining data %r',
-                             e.invalid_constructor_id, e.remaining)
+                               e.invalid_constructor_id, e.remaining)
                 continue
             except SecurityError as e:
                 # A step while decoding had the incorrect data. This message
                 # should not be considered safe and it should be ignored.
                 self._log.warning('Security error while unpacking a '
-                                'received message: %s', e)
+                                  'received message: %s', e)
                 continue
             except BufferError as e:
                 if isinstance(e, InvalidBufferError) and e.code == 404:
@@ -442,11 +436,11 @@ class MTProtoSender:
                 if self._auth_key_callback:
                     self._auth_key_callback(None)
 
-                self._start_reconnect()
+                self._start_reconnect(e)
                 return
-            except Exception:
+            except Exception as e:
                 self._log.exception('Unhandled error while receiving data')
-                self._start_reconnect()
+                self._start_reconnect(e)
                 return
 
             try:
@@ -502,7 +496,7 @@ class MTProtoSender:
         rpc_result = message.obj
         state = self._pending_state.pop(rpc_result.req_msg_id, None)
         self._log.debug('Handling RPC result for message %d',
-                      rpc_result.req_msg_id)
+                        rpc_result.req_msg_id)
 
         if not state:
             # TODO We should not get responses to things we never sent
@@ -514,8 +508,7 @@ class MTProtoSender:
                     if not isinstance(reader.tgread_object(), upload.File):
                         raise ValueError('Not an upload.File')
             except (TypeNotFoundError, ValueError):
-                self._log.info('Received response without parent request: {}'
-                               .format(rpc_result.body))
+                self._log.info('Received response without parent request: %s', rpc_result.body)
             return
 
         if rpc_result.error:
@@ -554,10 +547,15 @@ class MTProtoSender:
             await self._process_message(message)
 
     async def _handle_update(self, message):
-        self._log.debug('Handling update {}'
-                        .format(message.obj.__class__.__name__))
+        try:
+            assert message.obj.SUBCLASS_OF_ID == 0x8af52aac  # crc32(b'Updates')
+        except AssertionError:
+            self._log.warning('Note: %s is not an update, not dispatching it %s', message.obj)
+            return
+
+        self._log.debug('Handling update %s', message.obj.__class__.__name__)
         if self._update_callback:
-            await self._update_callback(message.obj)
+            self._update_callback(message.obj)
 
     async def _handle_pong(self, message):
         """

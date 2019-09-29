@@ -1,6 +1,19 @@
 import re
 
 
+def _fmt_strings(*dicts):
+    for d in dicts:
+        for k, v in d.items():
+            if v in ('None', 'True', 'False'):
+                d[k] = '<strong>{}</strong>'.format(v)
+            else:
+                d[k] = re.sub(
+                    r'([brf]?([\'"]).*\2)',
+                    lambda m: '<em>{}</em>'.format(m.group(1)),
+                    v
+                )
+
+
 KNOWN_NAMED_EXAMPLES = {
     ('message', 'string'): "'Hello there!'",
     ('expires_at', 'date'): 'datetime.timedelta(minutes=5)',
@@ -40,6 +53,8 @@ KNOWN_TYPED_EXAMPLES = {
     'InputFile': "client.upload_file('/path/to/file.jpg')",
     'InputPeer': "'username'"
 }
+
+_fmt_strings(KNOWN_NAMED_EXAMPLES, KNOWN_TYPED_EXAMPLES)
 
 SYNONYMS = {
     'InputUser': 'InputPeer',
@@ -140,7 +155,7 @@ class TLArg:
             # treated as a "date" object. Note that this is not a valid
             # Telegram object, but it's easier to work with
             if self.type == 'int' and (
-                        re.search(r'(\b|_)date\b', name) or
+                        re.search(r'(\b|_)([dr]ate|until|since)(\b|_)', name) or
                         name in ('expires', 'expires_at', 'was_online')):
                 self.type = 'date'
 
@@ -155,11 +170,13 @@ class TLArg:
             'long': 'int',
             'int128': 'int',
             'int256': 'int',
+            'double': 'float',
             'string': 'str',
             'date': 'Optional[datetime]',  # None date = 0 timestamp
             'bytes': 'bytes',
+            'Bool': 'bool',
             'true': 'bool',
-        }.get(cls, "Type{}".format(cls))
+        }.get(cls, "'Type{}'".format(cls))
         if self.is_vector:
             result = 'List[{}]'.format(result)
         if self.is_flag and cls != 'date':

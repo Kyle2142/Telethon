@@ -1,28 +1,31 @@
 import itertools
 import re
+import typing
 
-from .users import UserMethods
 from .. import utils
 from ..tl import types
 
+if typing.TYPE_CHECKING:
+    from .telegramclient import TelegramClient
 
-class MessageParseMethods(UserMethods):
+
+class MessageParseMethods:
 
     # region Public properties
 
     @property
-    def parse_mode(self):
+    def parse_mode(self: 'TelegramClient'):
         """
         This property is the default parse mode used when sending messages.
         Defaults to `telethon.extensions.markdown`. It will always
-        be either ``None`` or an object with ``parse`` and ``unparse``
+        be either `None` or an object with ``parse`` and ``unparse``
         methods.
 
         When setting a different value it should be one of:
 
         * Object with ``parse`` and ``unparse`` methods.
         * A ``callable`` to act as the parse method.
-        * A ``str`` indicating the ``parse_mode``. For Markdown ``'md'``
+        * A `str` indicating the ``parse_mode``. For Markdown ``'md'``
           or ``'markdown'`` may be used. For HTML, ``'htm'`` or ``'html'``
           may be used.
 
@@ -34,18 +37,27 @@ class MessageParseMethods(UserMethods):
         that ``assert text == unparse(*parse(text))``.
 
         See :tl:`MessageEntity` for allowed message entities.
+
+        Example
+            .. code-block:: python
+
+                # Disabling default formatting
+                client.parse_mode = None
+
+                # Enabling HTML as the default format
+                client.parse_mode = 'html'
         """
         return self._parse_mode
 
     @parse_mode.setter
-    def parse_mode(self, mode):
+    def parse_mode(self: 'TelegramClient', mode: str):
         self._parse_mode = utils.sanitize_parse_mode(mode)
 
     # endregion
 
     # region Private methods
 
-    async def _replace_with_mention(self, entities, i, user):
+    async def _replace_with_mention(self: 'TelegramClient', entities, i, user):
         """
         Helper method to replace ``entities[i]`` to mention ``user``,
         or do nothing if it can't be found.
@@ -59,7 +71,7 @@ class MessageParseMethods(UserMethods):
         except (ValueError, TypeError):
             return False
 
-    async def _parse_message_text(self, message, parse_mode):
+    async def _parse_message_text(self: 'TelegramClient', message, parse_mode):
         """
         Returns a (parsed message, entities) tuple depending on ``parse_mode``.
         """
@@ -89,23 +101,15 @@ class MessageParseMethods(UserMethods):
 
         return message, msg_entities
 
-    def _get_response_message(self, request, result, input_chat):
+    def _get_response_message(self: 'TelegramClient', request, result, input_chat):
         """
         Extracts the response message known a request and Update result.
         The request may also be the ID of the message to match.
-        """
-        # Telegram seems to send updateMessageID first, then updateNewMessage,
-        # however let's not rely on that just in case.
-        if isinstance(request, int):
-            msg_id = request
-        else:
-            msg_id = None
-            for update in result.updates:
-                if isinstance(update, types.UpdateMessageID):
-                    if update.random_id == request.random_id:
-                        msg_id = update.id
-                        break
 
+        If ``request is None`` this method returns ``{id: message}``.
+
+        If ``request.random_id`` is a list, this method returns a list too.
+        """
         if isinstance(result, types.UpdateShort):
             updates = [result.update]
             entities = {}
@@ -117,31 +121,78 @@ class MessageParseMethods(UserMethods):
         else:
             return None
 
-        found = None
+        random_to_id = {}
+        id_to_message = {}
+        sched_to_message = {}  # scheduled IDs may collide with normal IDs
         for update in updates:
-            if isinstance(update, (
+            if isinstance(update, types.UpdateMessageID):
+                random_to_id[update.random_id] = update.id
+
+            elif isinstance(update, (
                     types.UpdateNewChannelMessage, types.UpdateNewMessage)):
-                if update.message.id == msg_id:
-                    found = update.message
-                    break
+                update.message._finish_init(self, entities, input_chat)
+                id_to_message[update.message.id] = update.message
 
             elif (isinstance(update, types.UpdateEditMessage)
                   and not isinstance(request.peer, types.InputPeerChannel)):
                 if request.id == update.message.id:
-                    found = update.message
-                    break
+                    update.message._finish_init(self, entities, input_chat)
+                    return update.message
 
             elif (isinstance(update, types.UpdateEditChannelMessage)
                   and utils.get_peer_id(request.peer) ==
-                    utils.get_peer_id(update.message.to_id)):
+                  utils.get_peer_id(update.message.to_id)):
                 if request.id == update.message.id:
-                    found = update.message
-                    break
+                    update.message._finish_init(self, entities, input_chat)
+                    return update.message
 
-        if found:
-            found._finish_init(self, entities, input_chat)
-            return found
+            elif isinstance(update, types.UpdateNewScheduledMessage):
+                update.message._finish_init(self, entities, input_chat)
+                sched_to_message[update.message.id] = update.message
+
+        if request is None:
+            return id_to_message
+
+        # Use the scheduled mapping if we got a request with a scheduled message
+        #
+        # This breaks if the schedule date is too young, however, since the message
+        # is sent immediately, so have a fallback.
+        if getattr(request, 'schedule_date', None) is None:
+            mapping = id_to_message
+            opposite = {}  # if there's no schedule it can never be scheduled
         else:
-            return None  # explicit is better than implicit
+            mapping = sched_to_message
+            opposite = id_to_message  # scheduled may be treated as normal, though
+
+        random_id = request if isinstance(request, int) else request.random_id
+        if not utils.is_list_like(random_id):
+            msg = mapping.get(random_to_id.get(random_id))
+            if not msg:
+                msg = opposite.get(random_to_id.get(random_id))
+
+            if not msg:
+                self._log[__name__].warning(
+                    'Request %s had missing message mapping %s', request, result)
+
+            return msg
+
+        try:
+            return [mapping[random_to_id[rnd]] for rnd in random_id]
+        except KeyError:
+            try:
+                return [opposite[random_to_id[rnd]] for rnd in random_id]
+            except KeyError:
+                # Sometimes forwards fail (`MESSAGE_ID_INVALID` if a message gets
+                # deleted or `WORKER_BUSY_TOO_LONG_RETRY` if there are issues at
+                # Telegram), in which case we get some "missing" message mappings.
+                # Log them with the hope that we can better work around them.
+                self._log[__name__].warning(
+                    'Request %s had missing message mappings %s', request, result)
+
+        return [
+            mapping.get(random_to_id.get(rnd))
+            or opposite.get(random_to_id.get(rnd))
+            for rnd in random_to_id
+        ]
 
     # endregion

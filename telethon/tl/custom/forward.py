@@ -24,30 +24,25 @@ class Forward(ChatGetter, SenderGetter):
             in the original :tl:`MessageFwdHeader`.
     """
     def __init__(self, client, original, entities):
-        self.__dict__ = original.__dict__
-        self._client = client
+        # Copy all the fields, not reference! It would cause memory cycles:
+        #   self.original_fwd.original_fwd.original_fwd.original_fwd
+        # ...would be valid if we referenced.
+        self.__dict__.update(original.__dict__)
         self.original_fwd = original
 
-        self._sender_id = original.from_id
-        self._sender = entities.get(original.from_id)
-        try:
-            self._input_sender =\
-                utils.get_input_peer(self._sender) if self._sender else None
-        except TypeError:
-            self._input_sender = None
+        sender, input_sender = utils._get_entity_pair(
+            original.from_id, entities, client._entity_cache)
 
-        self._broadcast = None
-        if original.channel_id:
-            self._chat_peer = types.PeerChannel(original.channel_id)
-            self._chat = entities.get(utils.get_peer_id(self._chat_peer))
+        if not original.channel_id:
+            peer = chat = input_chat = None
         else:
-            self._chat_peer = None
-            self._chat = None
+            peer = types.PeerChannel(original.channel_id)
+            chat, input_chat = utils._get_entity_pair(
+                 utils.get_peer_id(peer), entities, client._entity_cache)
 
-        try:
-            self._input_chat = \
-                utils.get_input_peer(self._chat) if self._chat else None
-        except TypeError:
-            self._input_chat = None
+        # This call resets the client
+        ChatGetter.__init__(self, peer, chat=chat, input_chat=input_chat)
+        SenderGetter.__init__(self, original.from_id, sender=sender, input_sender=input_sender)
+        self._client = client
 
     # TODO We could reload the message

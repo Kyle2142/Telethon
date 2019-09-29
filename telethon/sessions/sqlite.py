@@ -1,8 +1,5 @@
 import datetime
-import json
 import os
-from base64 import b64decode
-from os.path import isfile as file_exists
 
 from telethon.tl import types
 from .memory import MemorySession, _SentFileType
@@ -20,7 +17,7 @@ except ImportError as e:
     sqlite3_err = type(e)
 
 EXTENSION = '.session'
-CURRENT_VERSION = 5  # database version
+CURRENT_VERSION = 6  # database version
 
 
 class SQLiteSession(MemorySession):
@@ -45,10 +42,6 @@ class SQLiteSession(MemorySession):
             if not self.filename.endswith(EXTENSION):
                 self.filename += EXTENSION
 
-        # Migrating from .json -> SQL
-        # TODO ^ Deprecate
-        entities = self._check_migrate_json()
-
         self._conn = None
         c = self._cursor()
         c.execute("select name from sqlite_master "
@@ -57,7 +50,7 @@ class SQLiteSession(MemorySession):
             # Tables already exist, check for the version
             c.execute("select version from version")
             version = c.fetchone()[0]
-            if version != CURRENT_VERSION:
+            if version < CURRENT_VERSION:
                 self._upgrade_database(old=version)
                 c.execute("delete from version")
                 c.execute("insert into version values (?)", (CURRENT_VERSION,))
@@ -112,12 +105,6 @@ class SQLiteSession(MemorySession):
                 )"""
             )
             c.execute("insert into version values (?)", (CURRENT_VERSION,))
-            # Migrating from JSON -> new table and may have entities
-            if entities:
-                c.executemany(
-                    'insert or replace into entities values (?,?,?,?,?)',
-                    entities
-                )
             self._update_session_table()
             c.close()
             self.save()
@@ -126,29 +113,6 @@ class SQLiteSession(MemorySession):
         cloned = super().clone(to_instance)
         cloned.save_entities = self.save_entities
         return cloned
-
-    def _check_migrate_json(self):
-        if file_exists(self.filename):
-            try:
-                with open(self.filename, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                self.delete()  # Delete JSON file to create database
-
-                self._port = data.get('port', self._port)
-                self._server_address = \
-                    data.get('server_address', self._server_address)
-
-                if data.get('auth_key_data', None) is not None:
-                    key = b64decode(data['auth_key_data'])
-                    self._auth_key = AuthKey(data=key)
-
-                rows = []
-                for p_id, p_hash in data.get('entities', []):
-                    if p_hash is not None:
-                        rows.append((p_id, p_hash, None, None, None))
-                return rows
-            except UnicodeDecodeError:
-                return []  # No entities
 
     def _upgrade_database(self, old):
         c = self._cursor()
@@ -179,6 +143,12 @@ class SQLiteSession(MemorySession):
         if old == 4:
             old += 1
             c.execute("alter table sessions add column takeout_id integer")
+        if old == 5:
+            # Not really any schema upgrade, but potentially all access
+            # hashes for User and Channel are wrong, so drop them off.
+            old += 1
+            c.execute('delete from entities')
+
         c.close()
 
     @staticmethod

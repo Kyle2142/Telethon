@@ -1,18 +1,32 @@
 import asyncio
+import datetime
 import itertools
 import time
+import typing
 
-from .telegrambaseclient import TelegramBaseClient
-from .. import errors, utils
+from .. import errors, utils, hints
 from ..errors import MultiError, RPCError
-from ..tl import TLObject, TLRequest, types, functions
 from ..helpers import retry_range
+from ..tl import TLRequest, types, functions
 
 _NOT_A_REQUEST = lambda: TypeError('You can only invoke requests, not types!')
 
+if typing.TYPE_CHECKING:
+    from .telegramclient import TelegramClient
 
-class UserMethods(TelegramBaseClient):
-    async def __call__(self, request, ordered=False):
+
+def _fmt_flood(delay, request, *, early=False, td=datetime.timedelta):
+    return (
+        'Sleeping%s for %ds (%s) on %s flood wait',
+        ' early' if early else '',
+        delay,
+        td(seconds=delay),
+        request.__class__.__name__
+    )
+
+
+class UserMethods:
+    async def __call__(self: 'TelegramClient', request, ordered=False):
         requests = (request if utils.is_list_like(request) else (request,))
         for r in requests:
             if not isinstance(r, TLRequest):
@@ -26,12 +40,11 @@ class UserMethods(TelegramBaseClient):
                 if diff <= 3:  # Flood waits below 3 seconds are "ignored"
                     self._flood_waited_requests.pop(r.CONSTRUCTOR_ID, None)
                 elif diff <= self.flood_sleep_threshold:
-                    self._log[__name__].info(
-                        'Sleeping early for %ds on flood wait', diff)
+                    self._log[__name__].info(*_fmt_flood(diff, r, early=True))
                     await asyncio.sleep(diff, loop=self._loop)
                     self._flood_waited_requests.pop(r.CONSTRUCTOR_ID, None)
                 else:
-                    raise errors.FloodWaitError(r, capture=diff)
+                    raise errors.FloodWaitError(request=r, capture=diff)
 
         request_index = 0
         self._last_request = time.time()
@@ -49,6 +62,7 @@ class UserMethods(TelegramBaseClient):
                             results.append(None)
                             continue
                         self.session.process_entities(result)
+                        self._entity_cache.add(result)
                         exceptions.append(None)
                         results.append(result)
                         request_index += 1
@@ -59,6 +73,7 @@ class UserMethods(TelegramBaseClient):
                 else:
                     result = await future
                     self.session.process_entities(result)
+                    self._entity_cache.add(result)
                     return result
             except (errors.ServerError, errors.RpcCallFailError,
                     errors.RpcMcgetFailError) as e:
@@ -67,7 +82,7 @@ class UserMethods(TelegramBaseClient):
                     e.__class__.__name__, e)
 
                 await asyncio.sleep(2)
-            except (errors.FloodWaitError, errors.FloodTestPhoneWaitError) as e:
+            except (errors.FloodWaitError, errors.SlowModeWaitError, errors.FloodTestPhoneWaitError) as e:
                 if utils.is_list_like(request):
                     request = request[request_index]
 
@@ -75,8 +90,7 @@ class UserMethods(TelegramBaseClient):
                     [request.CONSTRUCTOR_ID] = time.time() + e.seconds
 
                 if e.seconds <= self.flood_sleep_threshold:
-                    self._log[__name__].info('Sleeping for %ds on flood wait',
-                                             e.seconds)
+                    self._log[__name__].info(*_fmt_flood(e.seconds, request))
                     await asyncio.sleep(e.seconds, loop=self._loop)
                 else:
                     raise
@@ -95,19 +109,27 @@ class UserMethods(TelegramBaseClient):
 
     # region Public methods
 
-    async def get_me(self, input_peer=False):
+    async def get_me(self: 'TelegramClient', input_peer: bool = False) \
+            -> 'typing.Union[types.User, types.InputPeerUser]':
         """
-        Gets "me" (the self user) which is currently authenticated,
-        or None if the request fails (hence, not authenticated).
+        Gets "me", the current :tl:`User` who is logged in.
 
-        Args:
+        If the user has not logged in yet, this method returns `None`.
+
+        Arguments
             input_peer (`bool`, optional):
                 Whether to return the :tl:`InputPeerUser` version or the normal
                 :tl:`User`. This can be useful if you just need to know the ID
                 of yourself.
 
-        Returns:
+        Returns
             Your own :tl:`User`.
+
+        Example
+            .. code-block:: python
+
+                me = await client.get_me()
+                print(me.username)
         """
         if input_peer and self._self_input_peer:
             return self._self_input_peer
@@ -126,60 +148,100 @@ class UserMethods(TelegramBaseClient):
         except errors.UnauthorizedError:
             return None
 
-    async def is_bot(self):
+    async def is_bot(self: 'TelegramClient') -> bool:
         """
-        Return ``True`` if the signed-in user is a bot, ``False`` otherwise.
+        Return `True` if the signed-in user is a bot, `False` otherwise.
+
+        Example
+            .. code-block:: python
+
+                if await client.is_bot():
+                    print('Beep')
+                else:
+                    print('Hello')
         """
         if self._bot is None:
             self._bot = (await self.get_me()).bot
 
         return self._bot
 
-    async def is_user_authorized(self):
+    async def is_user_authorized(self: 'TelegramClient') -> bool:
         """
-        Returns ``True`` if the user is authorized.
+        Returns `True` if the user is authorized (logged in).
+
+        Example
+            .. code-block:: python
+
+                if not await client.is_user_authorized():
+                    await client.send_code_request(phone)
+                    code = input('enter code: ')
+                    await client.sign_in(phone, code)
         """
         if self._authorized is None:
             try:
-                self._state = await self(functions.updates.GetStateRequest())
+                # Any request that requires authorization will work
+                await self(functions.updates.GetStateRequest())
                 self._authorized = True
             except errors.RPCError:
                 self._authorized = False
 
         return self._authorized
 
-    async def get_entity(self, entity):
+    async def get_entity(
+            self: 'TelegramClient',
+            entity: 'hints.EntitiesLike') -> 'hints.Entity':
         """
         Turns the given entity into a valid Telegram :tl:`User`, :tl:`Chat`
         or :tl:`Channel`. You can also pass a list or iterable of entities,
         and they will be efficiently fetched from the network.
 
-        entity (`str` | `int` | :tl:`Peer` | :tl:`InputPeer`):
-            If a username is given, **the username will be resolved** making
-            an API call every time. Resolving usernames is an expensive
-            operation and will start hitting flood waits around 50 usernames
-            in a short period of time.
+        Arguments
+            entity (`str` | `int` | :tl:`Peer` | :tl:`InputPeer`):
+                If a username is given, **the username will be resolved** making
+                an API call every time. Resolving usernames is an expensive
+                operation and will start hitting flood waits around 50 usernames
+                in a short period of time.
 
-            If you want to get the entity for a *cached* username, you should
-            first `get_input_entity(username) <get_input_entity>` which will
-            use the cache), and then use `get_entity` with the result of the
-            previous call.
+                If you want to get the entity for a *cached* username, you should
+                first `get_input_entity(username) <get_input_entity>` which will
+                use the cache), and then use `get_entity` with the result of the
+                previous call.
 
-            Similar limits apply to invite links, and you should use their
-            ID instead.
+                Similar limits apply to invite links, and you should use their
+                ID instead.
 
-            Using phone numbers (from people in your contact list), exact
-            names, integer IDs or :tl:`Peer` rely on a `get_input_entity`
-            first, which in turn needs the entity to be in cache, unless
-            a :tl:`InputPeer` was passed.
+                Using phone numbers (from people in your contact list), exact
+                names, integer IDs or :tl:`Peer` rely on a `get_input_entity`
+                first, which in turn needs the entity to be in cache, unless
+                a :tl:`InputPeer` was passed.
 
-            Unsupported types will raise ``TypeError``.
+                Unsupported types will raise ``TypeError``.
 
-            If the entity can't be found, ``ValueError`` will be raised.
+                If the entity can't be found, ``ValueError`` will be raised.
 
-        Returns:
+        Returns
             :tl:`User`, :tl:`Chat` or :tl:`Channel` corresponding to the
             input entity. A list will be returned if more than one was given.
+
+        Example
+            .. code-block:: python
+
+                from telethon import utils
+
+                me = await client.get_entity('me')
+                print(utils.get_display_name(me))
+
+                chat = await client.get_input_entity('username')
+                async for message in client.iter_messages(chat):
+                    ...
+
+                # Note that you could have used the username directly, but it's
+                # good to use get_input_entity if you will reuse it a lot.
+                async for message in client.iter_messages('username'):
+                    ...
+
+                # Note that for this to work the phone number must be in your contacts
+                some_id = await client.get_peer_id('+34123456789')
         """
         single = not utils.is_list_like(entity)
         if single:
@@ -240,85 +302,98 @@ class UserMethods(TelegramBaseClient):
 
         return result[0] if single else result
 
-    async def get_input_entity(self, peer):
+    async def get_input_entity(
+            self: 'TelegramClient',
+            peer: 'hints.EntityLike') -> 'types.TypeInputPeer':
         """
-        Turns the given peer into its input entity version. Most requests
-        use this kind of :tl:`InputPeer`, so this is the most suitable call
-        to make for those cases. **Generally you should let the library do
-        its job** and don't worry about getting the input entity first, but
-        if you're going to use an entity often, consider making the call:
+        Turns the given entity into its input entity version.
 
-        >>> import asyncio
-        >>> rc = asyncio.get_event_loop().run_until_complete
-        >>>
-        >>> from telethon import TelegramClient
-        >>> client = TelegramClient(...)
-        >>> # If you're going to use "username" often in your code
-        >>> # (make a lot of calls), consider getting its input entity
-        >>> # once, and then using the "user" everywhere instead.
-        >>> user = rc(client.get_input_entity('username'))
-        >>> # The same applies to IDs, chats or channels.
-        >>> chat = rc(client.get_input_entity(-123456789))
+        Most requests use this kind of :tl:`InputPeer`, so this is the most
+        suitable call to make for those cases. **Generally you should let the
+        library do its job** and don't worry about getting the input entity
+        first, but if you're going to use an entity often, consider making the
+        call:
 
-        entity (`str` | `int` | :tl:`Peer` | :tl:`InputPeer`):
-            If a username or invite link is given, **the library will
-            use the cache**. This means that it's possible to be using
-            a username that *changed* or an old invite link (this only
-            happens if an invite link for a small group chat is used
-            after it was upgraded to a mega-group).
+        Arguments
+            entity (`str` | `int` | :tl:`Peer` | :tl:`InputPeer`):
+                If a username or invite link is given, **the library will
+                use the cache**. This means that it's possible to be using
+                a username that *changed* or an old invite link (this only
+                happens if an invite link for a small group chat is used
+                after it was upgraded to a mega-group).
 
-            If the username or ID from the invite link is not found in
-            the cache, it will be fetched. The same rules apply to phone
-            numbers (``'+34 123456789'``) from people in your contact list.
+                If the username or ID from the invite link is not found in
+                the cache, it will be fetched. The same rules apply to phone
+                numbers (``'+34 123456789'``) from people in your contact list.
 
-            If an exact name is given, it must be in the cache too. This
-            is not reliable as different people can share the same name
-            and which entity is returned is arbitrary, and should be used
-            only for quick tests.
+                If an exact name is given, it must be in the cache too. This
+                is not reliable as different people can share the same name
+                and which entity is returned is arbitrary, and should be used
+                only for quick tests.
 
-            If a positive integer ID is given, the entity will be searched
-            in cached users, chats or channels, without making any call.
+                If a positive integer ID is given, the entity will be searched
+                in cached users, chats or channels, without making any call.
 
-            If a negative integer ID is given, the entity will be searched
-            exactly as either a chat (prefixed with ``-``) or as a channel
-            (prefixed with ``-100``).
+                If a negative integer ID is given, the entity will be searched
+                exactly as either a chat (prefixed with ``-``) or as a channel
+                (prefixed with ``-100``).
 
-            If a :tl:`Peer` is given, it will be searched exactly in the
-            cache as either a user, chat or channel.
+                If a :tl:`Peer` is given, it will be searched exactly in the
+                cache as either a user, chat or channel.
 
-            If the given object can be turned into an input entity directly,
-            said operation will be done.
+                If the given object can be turned into an input entity directly,
+                said operation will be done.
 
-            Unsupported types will raise ``TypeError``.
+                Unsupported types will raise ``TypeError``.
 
-            If the entity can't be found, ``ValueError`` will be raised.
+                If the entity can't be found, ``ValueError`` will be raised.
 
-        Returns:
+        Returns
             :tl:`InputPeerUser`, :tl:`InputPeerChat` or :tl:`InputPeerChannel`
             or :tl:`InputPeerSelf` if the parameter is ``'me'`` or ``'self'``.
 
             If you need to get the ID of yourself, you should use
             `get_me` with ``input_peer=True``) instead.
+
+        Example
+            .. code-block:: python
+
+                # If you're going to use "username" often in your code
+                # (make a lot of calls), consider getting its input entity
+                # once, and then using the "user" everywhere instead.
+                user = await client.get_input_entity('username')
+
+                # The same applies to IDs, chats or channels.
+                chat = await client.get_input_entity(-123456789)
         """
+        # Short-circuit if the input parameter directly maps to an InputPeer
+        try:
+            return utils.get_input_peer(peer)
+        except TypeError:
+            pass
+
+        # Next in priority is having a peer (or its ID) cached in-memory
+        try:
+            # 0x2d45687 == crc32(b'Peer')
+            if isinstance(peer, int) or peer.SUBCLASS_OF_ID == 0x2d45687:
+                return self._entity_cache[peer]
+        except (AttributeError, KeyError):
+            pass
+
+        # Then come known strings that take precedence
         if peer in ('me', 'self'):
             return types.InputPeerSelf()
 
+        # No InputPeer, cached peer, or known string. Fetch from disk cache
         try:
-            # First try to get the entity from cache, otherwise figure it out
             return self.session.get_input_entity(peer)
         except ValueError:
             pass
 
+        # Only network left to try
         if isinstance(peer, str):
             return utils.get_input_peer(
                 await self._get_entity_from_string(peer))
-
-        if not isinstance(peer, int) and (not isinstance(peer, TLObject)
-                                          or peer.SUBCLASS_OF_ID != 0x2d45687):
-            # Try casting the object into an input peer. Might TypeError.
-            # Don't do it if a not-found ID was given (instead ValueError).
-            # Also ignore Peer (0x2d45687 == crc32(b'Peer'))'s, lacking hash.
-            return utils.get_input_peer(peer)
 
         # If we're a bot and the user has messaged us privately users.getUsers
         # will work with access_hash = 0. Similar for channels.getChannels.
@@ -349,20 +424,28 @@ class UserMethods(TelegramBaseClient):
 
         raise ValueError(
             'Could not find the input entity for {!r}. Please read https://'
-            'telethon.readthedocs.io/en/latest/extra/basic/entities.html to'
+            'docs.telethon.dev/en/latest/concepts/entities.html to'
             ' find out more details.'
             .format(peer)
         )
 
-    async def get_peer_id(self, peer, add_mark=True):
+    async def get_peer_id(
+            self: 'TelegramClient',
+            peer: 'hints.EntityLike',
+            add_mark: bool = True) -> int:
         """
-        Gets the ID for the given peer, which may be anything entity-like.
+        Gets the ID for the given entity.
 
         This method needs to be ``async`` because `peer` supports usernames,
         invite-links, phone numbers (from people in your contact list), etc.
 
         If ``add_mark is False``, then a positive ID will be returned
         instead. By default, bot-API style IDs (signed) are returned.
+
+        Example
+            .. code-block:: python
+
+                print(await client.get_peer_id('me'))
         """
         if isinstance(peer, int):
             return utils.get_peer_id(peer, add_mark=add_mark)
@@ -383,7 +466,7 @@ class UserMethods(TelegramBaseClient):
 
     # region Private methods
 
-    async def _get_entity_from_string(self, string):
+    async def _get_entity_from_string(self: 'TelegramClient', string):
         """
         Gets a full entity from the given string, which may be a phone or
         a username, and processes all the found entities on the session.
@@ -447,7 +530,7 @@ class UserMethods(TelegramBaseClient):
             'Cannot find any entity corresponding to "{}"'.format(string)
         )
 
-    async def _get_input_dialog(self, dialog):
+    async def _get_input_dialog(self: 'TelegramClient', dialog):
         """
         Returns a :tl:`InputDialogPeer`. This is a bit tricky because
         it may or not need access to the client to convert what's given
@@ -464,7 +547,7 @@ class UserMethods(TelegramBaseClient):
 
         return types.InputDialogPeer(await self.get_input_entity(dialog))
 
-    async def _get_input_notify(self, notify):
+    async def _get_input_notify(self: 'TelegramClient', notify):
         """
         Returns a :tl:`InputNotifyPeer`. This is a bit tricky because
         it may or not need access to the client to convert what's given

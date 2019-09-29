@@ -86,7 +86,8 @@ class MemorySession(Session):
     def delete(self):
         pass
 
-    def _entity_values_to_row(self, id, hash, username, phone, name):
+    @staticmethod
+    def _entity_values_to_row(id, hash, username, phone, name):
         # While this is a simple implementation it might be overrode by,
         # other classes so they don't need to implement the plural form
         # of the method. Don't remove.
@@ -99,18 +100,14 @@ class MemorySession(Session):
             p = utils.get_input_peer(e, allow_self=False)
             marked_id = utils.get_peer_id(p)
         except TypeError:
+            # Note: `get_input_peer` already checks for non-zero `access_hash`.
+            #        See issues #354 and #392. It also checks that the entity
+            #        is not `min`, because its `access_hash` cannot be used
+            #        anywhere (since layer 102, there are two access hashes).
             return
 
         if isinstance(p, (InputPeerUser, InputPeerChannel)):
-            if not p.access_hash:
-                # Some users and channels seem to be returned without
-                # an 'access_hash', meaning Telegram doesn't want you
-                # to access them. This is the reason behind ensuring
-                # that the 'access_hash' is non-zero. See issue #354.
-                # Note that this checks for zero or None, see #392.
-                return
-            else:
-                p_hash = p.access_hash
+            p_hash = p.access_hash
         elif isinstance(p, InputPeerChat):
             p_hash = 0
         else:

@@ -2,10 +2,10 @@ import datetime
 
 from .. import TLObject
 from ..functions.messages import SaveDraftRequest
-from ..types import UpdateDraftMessage, DraftMessage
+from ..types import DraftMessage
 from ...errors import RPCError
 from ...extensions import markdown
-from ...utils import get_peer_id, get_input_peer
+from ...utils import get_input_peer, get_peer
 
 
 class Draft:
@@ -24,9 +24,9 @@ class Draft:
         reply_to_msg_id (`int`):
             The message ID that the draft will reply to.
     """
-    def __init__(self, client, peer, draft, entity):
+    def __init__(self, client, entity, draft):
         self._client = client
-        self._peer = peer
+        self._peer = get_peer(entity)
         self._entity = entity
         self._input_entity = get_input_peer(entity) if entity else None
 
@@ -38,17 +38,6 @@ class Draft:
         self.date = draft.date
         self.link_preview = not draft.no_webpage
         self.reply_to_msg_id = draft.reply_to_msg_id
-
-    @classmethod
-    def _from_dialog(cls, client, dialog):
-        return cls(client=client, peer=dialog.dialog.peer,
-                   draft=dialog.dialog.draft, entity=dialog.entity)
-
-    @classmethod
-    def _from_update(cls, client, update, entities=None):
-        assert isinstance(update, UpdateDraftMessage)
-        return cls(client=client, peer=update.peer, draft=update.draft,
-                   entity=(entities or {}).get(get_peer_id(update.peer)))
 
     @property
     def entity(self):
@@ -64,9 +53,8 @@ class Draft:
         """
         if not self._input_entity:
             try:
-                self._input_entity =\
-                    self._client.session.get_input_entity(self._peer)
-            except ValueError:
+                self._input_entity = self._client._entity_cache[self._peer]
+            except KeyError:
                 pass
 
         return self._input_entity
@@ -132,7 +120,7 @@ class Draft:
                                   Preserved if left as None.
 
         :param str parse_mode: The parse mode to be used for the text.
-        :return bool: ``True`` on success.
+        :return bool: `True` on success.
         """
         if text is None:
             text = self._text
@@ -176,7 +164,7 @@ class Draft:
 
     async def delete(self):
         """
-        Deletes this draft, and returns ``True`` on success.
+        Deletes this draft, and returns `True` on success.
         """
         return await self.set_message(text='')
 

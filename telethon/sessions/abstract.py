@@ -22,6 +22,14 @@ class Session(ABC):
 
     @property
     @abstractmethod
+    def dc_id(self):
+        """
+        Returns the currently-used data center ID.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
     def server_address(self):
         """
         Returns the server address where the library should connect to.
@@ -41,7 +49,7 @@ class Session(ABC):
     def auth_key(self):
         """
         Returns an ``AuthKey`` instance associated with the saved
-        data center, or ``None`` if a new one should be generated.
+        data center, or `None` if a new one should be generated.
         """
         raise NotImplementedError
 
@@ -58,7 +66,7 @@ class Session(ABC):
     def takeout_id(self):
         """
         Returns an ID of the takeout process initialized for this session,
-        or ``None`` if there's no were any unfinished takeout requests.
+        or `None` if there's no were any unfinished takeout requests.
         """
         raise NotImplementedError
 

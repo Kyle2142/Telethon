@@ -66,7 +66,8 @@ class AdminLogEvent:
         if isinstance(ori, (
                 types.ChannelAdminLogEventActionChangeAbout,
                 types.ChannelAdminLogEventActionChangeTitle,
-                types.ChannelAdminLogEventActionChangeUsername
+                types.ChannelAdminLogEventActionChangeUsername,
+                types.ChannelAdminLogEventActionChangeLocation
         )):
             return ori.prev_value
         elif isinstance(ori, types.ChannelAdminLogEventActionChangePhoto):
@@ -103,7 +104,8 @@ class AdminLogEvent:
                 types.ChannelAdminLogEventActionChangeUsername,
                 types.ChannelAdminLogEventActionToggleInvites,
                 types.ChannelAdminLogEventActionTogglePreHistoryHidden,
-                types.ChannelAdminLogEventActionToggleSignatures
+                types.ChannelAdminLogEventActionToggleSignatures,
+                types.ChannelAdminLogEventActionChangeLocation
         )):
             return ori.new_value
         elif isinstance(ori, types.ChannelAdminLogEventActionChangePhoto):
@@ -127,9 +129,9 @@ class AdminLogEvent:
     @property
     def changed_about(self):
         """
-        Whether the channel's about was changed in this event or not.
+        Whether the channel's about was changed or not.
 
-        If ``True``, `old` and `new` will be present as ``str``.
+        If `True`, `old` and `new` will be present as `str`.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionChangeAbout)
@@ -137,9 +139,9 @@ class AdminLogEvent:
     @property
     def changed_title(self):
         """
-        Whether the channel's title was changed in this event or not.
+        Whether the channel's title was changed or not.
 
-        If ``True``, `old` and `new` will be present as ``str``.
+        If `True`, `old` and `new` will be present as `str`.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionChangeTitle)
@@ -147,9 +149,9 @@ class AdminLogEvent:
     @property
     def changed_username(self):
         """
-        Whether the channel's username was changed in this event or not.
+        Whether the channel's username was changed or not.
 
-        If ``True``, `old` and `new` will be present as ``str``.
+        If `True`, `old` and `new` will be present as `str`.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionChangeUsername)
@@ -157,9 +159,9 @@ class AdminLogEvent:
     @property
     def changed_photo(self):
         """
-        Whether the channel's photo was changed in this event or not.
+        Whether the channel's photo was changed or not.
 
-        If ``True``, `old` and `new` will be present as :tl:`ChatPhoto`.
+        If `True`, `old` and `new` will be present as :tl:`Photo`.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionChangePhoto)
@@ -167,9 +169,9 @@ class AdminLogEvent:
     @property
     def changed_sticker_set(self):
         """
-        Whether the channel's sticker set was changed in this event or not.
+        Whether the channel's sticker set was changed or not.
 
-        If ``True``, `old` and `new` will be present as :tl:`InputStickerSet`.
+        If `True`, `old` and `new` will be present as :tl:`InputStickerSet`.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionChangeStickerSet)
@@ -177,9 +179,9 @@ class AdminLogEvent:
     @property
     def changed_message(self):
         """
-        Whether a message in this channel was edited in this event or not.
+        Whether a message in this channel was edited or not.
 
-        If ``True``, `old` and `new` will be present as
+        If `True`, `old` and `new` will be present as
         `Message <telethon.tl.custom.message.Message>`.
         """
         return isinstance(self.original.action,
@@ -188,9 +190,9 @@ class AdminLogEvent:
     @property
     def deleted_message(self):
         """
-        Whether a message in this channel was deleted in this event or not.
+        Whether a message in this channel was deleted or not.
 
-        If ``True``, `old` will be present as
+        If `True`, `old` will be present as
         `Message <telethon.tl.custom.message.Message>`.
         """
         return isinstance(self.original.action,
@@ -200,9 +202,9 @@ class AdminLogEvent:
     def changed_admin(self):
         """
         Whether the permissions for an admin in this channel
-        changed in this event or not.
+        changed or not.
 
-        If ``True``, `old` and `new` will be present as
+        If `True`, `old` and `new` will be present as
         :tl:`ChannelParticipant`.
         """
         return isinstance(
@@ -212,9 +214,9 @@ class AdminLogEvent:
     @property
     def changed_restrictions(self):
         """
-        Whether a message in this channel was edited in this event or not.
+        Whether a message in this channel was edited or not.
 
-        If ``True``, `old` and `new` will be present as
+        If `True`, `old` and `new` will be present as
         :tl:`ChannelParticipant`.
         """
         return isinstance(
@@ -224,18 +226,28 @@ class AdminLogEvent:
     @property
     def changed_invites(self):
         """
-        Whether the invites in the channel were toggled in this event or not.
+        Whether the invites in the channel were toggled or not.
 
-        If ``True``, `old` and `new` will be present as ``bool``.
+        If `True`, `old` and `new` will be present as `bool`.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionToggleInvites)
 
     @property
+    def changed_location(self):
+        """
+        Whether the location setting of the channel has changed or not.
+
+        If `True`, `old` and `new` will be present as :tl:`ChannelLocation`.
+        """
+        return isinstance(self.original.action,
+                          types.ChannelAdminLogEventActionChangeLocation)
+
+    @property
     def joined(self):
         """
         Whether `user` joined through the channel's
-        public username in this event or not.
+        public username or not.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionParticipantJoin)
@@ -244,9 +256,9 @@ class AdminLogEvent:
     def joined_invite(self):
         """
         Whether a new user joined through an invite
-        link to the channel in this event or not.
+        link to the channel or not.
 
-        If ``True``, `new` will be present as
+        If `True`, `new` will be present as
         :tl:`ChannelParticipant`.
         """
         return isinstance(self.original.action,
@@ -255,7 +267,7 @@ class AdminLogEvent:
     @property
     def left(self):
         """
-        Whether `user` left the channel in this event or not.
+        Whether `user` left the channel or not.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionParticipantLeave)
@@ -264,9 +276,9 @@ class AdminLogEvent:
     def changed_hide_history(self):
         """
         Whether hiding the previous message history for new members
-        in the channel were toggled in this event or not.
+        in the channel was toggled or not.
 
-        If ``True``, `old` and `new` will be present as ``bool``.
+        If `True`, `old` and `new` will be present as `bool`.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionTogglePreHistoryHidden)
@@ -275,9 +287,9 @@ class AdminLogEvent:
     def changed_signatures(self):
         """
         Whether the message signatures in the channel were toggled
-        in this event or not.
+        or not.
 
-        If ``True``, `old` and `new` will be present as ``bool``.
+        If `True`, `old` and `new` will be present as `bool`.
         """
         return isinstance(self.original.action,
                           types.ChannelAdminLogEventActionToggleSignatures)
@@ -285,9 +297,9 @@ class AdminLogEvent:
     @property
     def changed_pin(self):
         """
-        Whether a new message in this channel was pinned in this event or not.
+        Whether a new message in this channel was pinned or not.
 
-        If ``True``, `new` will be present as
+        If `True`, `new` will be present as
         `Message <telethon.tl.custom.message.Message>`.
         """
         return isinstance(self.original.action,
@@ -296,9 +308,9 @@ class AdminLogEvent:
     @property
     def changed_default_banned_rights(self):
         """
-        Whether the default banned rights were changed in this event or not.
+        Whether the default banned rights were changed or not.
 
-        If ``True``, `old` and `new` will
+        If `True`, `old` and `new` will
         be present as :tl:`ChatBannedRights`.
         """
         return isinstance(self.original.action,
@@ -307,9 +319,9 @@ class AdminLogEvent:
     @property
     def stopped_poll(self):
         """
-        Whether a poll was stopped in this event or not.
+        Whether a poll was stopped or not.
 
-        If ``True``, `new` will be present as
+        If `True`, `new` will be present as
         `Message <telethon.tl.custom.message.Message>`.
         """
         return isinstance(self.original.action,

@@ -3,7 +3,12 @@ import itertools
 import time
 
 from .chatgetter import ChatGetter
-from ... import utils, errors
+from ... import helpers, utils, errors
+
+# Sometimes the edits arrive very fast (within the same second).
+# In that case we add a small delta so that the age is older, for
+# comparision purposes. This value is enough for up to 1000 messages.
+_EDIT_COLLISION_DELTA = 0.001
 
 
 class Conversation(ChatGetter):
@@ -24,15 +29,13 @@ class Conversation(ChatGetter):
     def __init__(self, client, input_chat,
                  *, timeout, total_timeout, max_messages,
                  exclusive, replies_are_responses):
+        # This call resets the client
+        ChatGetter.__init__(self, input_chat=input_chat)
+
         self._id = Conversation._id_counter
         Conversation._id_counter += 1
 
         self._client = client
-        self._chat = None
-        self._input_chat = input_chat
-        self._chat_peer = None
-        self._broadcast = None
-
         self._timeout = timeout
         self._total_timeout = total_timeout
         self._total_due = None
@@ -51,6 +54,7 @@ class Conversation(ChatGetter):
         self._pending_reads = {}
 
         self._exclusive = exclusive
+        self._cancelled = False
 
         # The user is able to expect two responses for the same message.
         # {desired message ID: next incoming index}
@@ -107,9 +111,9 @@ class Conversation(ChatGetter):
         return self._client.send_read_acknowledge(
             self._input_chat, max_id=message)
 
-    async def get_response(self, message=None, *, timeout=None):
+    def get_response(self, message=None, *, timeout=None):
         """
-        Returns a coroutine that will resolve once a response arrives.
+        Gets the next message that responds to a previous one.
 
         Args:
             message (`Message <telethon.tl.custom.message.Message>` | `int`, optional):
@@ -117,21 +121,19 @@ class Conversation(ChatGetter):
                 is expected. By default this is the last sent message.
 
             timeout (`int` | `float`, optional):
-                If present, this `timeout` will override the
+                If present, this `timeout` (in seconds) will override the
                 per-action timeout defined for the conversation.
         """
-        return await self._get_message(
+        return self._get_message(
             message, self._response_indices, self._pending_responses, timeout,
             lambda x, y: True
         )
 
-    async def get_reply(self, message=None, *, timeout=None):
+    def get_reply(self, message=None, *, timeout=None):
         """
-        Returns a coroutine that will resolve once a reply
-        (that is, a message being a reply) arrives. The
-        arguments are the same as those for `get_response`.
+        Gets the next message that explicitly replies to a previous one.
         """
-        return await self._get_message(
+        return self._get_message(
             message, self._reply_indices, self._pending_replies, timeout,
             lambda x, y: x.reply_to_msg_id == y
         )
@@ -155,7 +157,7 @@ class Conversation(ChatGetter):
                 once `condition` is met.
 
             timeout (`int`):
-                The timeout override to use for this operation.
+                The timeout (in seconds) override to use for this operation.
 
             condition (`callable`):
                 The condition callable that checks if an incoming
@@ -190,10 +192,14 @@ class Conversation(ChatGetter):
                 return future
 
         # Otherwise the next incoming response will be the one to use
+        #
+        # Note how we fill "pending" before giving control back to the
+        # event loop through "await". We want to register it as soon as
+        # possible, since any other task switch may arrive with the result.
         pending[target_id] = future
-        return self._get_result(future, start_time, timeout)
+        return self._get_result(future, start_time, timeout, pending, target_id)
 
-    async def get_edit(self, message=None, *, timeout=None):
+    def get_edit(self, message=None, *, timeout=None):
         """
         Awaits for an edit after the last message to arrive.
         The arguments are the same as those for `get_response`.
@@ -217,15 +223,15 @@ class Conversation(ChatGetter):
             return earliest_edit
 
         # Otherwise the next incoming response will be the one to use
-        future = asyncio.Future(loop=self._client.loop)
+        future = self._client.loop.create_future()
         self._pending_edits[target_id] = future
-        return await self._get_result(future, start_time, timeout)
+        return self._get_result(future, start_time, timeout, self._pending_edits, target_id)
 
-    async def wait_read(self, message=None, *, timeout=None):
+    def wait_read(self, message=None, *, timeout=None):
         """
-        Awaits for the sent message to be read. Note that receiving
-        a response doesn't imply the message was read, and this action
-        will also trigger even without a response.
+        Awaits for the sent message to be marked as read. Note that
+        receiving a response doesn't imply the message was read, and
+        this action will also trigger even without a response.
         """
         start_time = time.time()
         future = self._client.loop.create_future()
@@ -238,11 +244,17 @@ class Conversation(ChatGetter):
             return
 
         self._pending_reads[target_id] = future
-        return await self._get_result(future, start_time, timeout)
+        return self._get_result(future, start_time, timeout, self._pending_reads, target_id)
 
     async def wait_event(self, event, *, timeout=None):
         """
         Waits for a custom event to occur. Timeouts still apply.
+
+        .. note::
+
+            Only use this if there isn't another method available!
+            For example, don't use `wait_event` for new messages,
+            since `get_response` already exists, etc.
 
         Unless you're certain that your code will run fast enough,
         generally you should get a "handle" of this special coroutine
@@ -273,26 +285,17 @@ class Conversation(ChatGetter):
         counter = Conversation._custom_counter
         Conversation._custom_counter += 1
 
-        future = asyncio.Future(loop=self._client.loop)
-
-        # We need the `async def` here because we want to block on the future
-        # from `_get_result` by using `await` on it. If we returned the future
-        # immediately we would `del` from `_custom` too early.
-
-        async def result():
-            try:
-                return await self._get_result(future, start_time, timeout)
-            finally:
-                del self._custom[counter]
-
+        future = self._client.loop.create_future()
         self._custom[counter] = (event, future)
-        return await result()
+        return await self._get_result(future, start_time, timeout, self._custom, counter)
 
     async def _check_custom(self, built):
-        for i, (ev, fut) in self._custom.items():
+        for key, (ev, fut) in list(self._custom.items()):
             ev_type = type(ev)
-            if built[ev_type] and ev.filter(built[ev_type]):
-                fut.set_result(built[ev_type])
+            inst = built[ev_type]
+            if inst and ev.filter(inst):
+                fut.set_result(inst)
+                del self._custom[key]
 
     def _on_new_message(self, response):
         response = response.message
@@ -305,36 +308,41 @@ class Conversation(ChatGetter):
 
         self._incoming.append(response)
 
-        found = []
-        for msg_id in self._pending_responses:
-            found.append(msg_id)
+        # Most of the time, these dictionaries will contain just one item
+        # TODO In fact, why not make it be that way? Force one item only.
+        #      How often will people want to wait for two responses at
+        #      the same time? It's impossible, first one will arrive
+        #      and then another, so they can do that.
+        for msg_id, future in list(self._pending_responses.items()):
             self._response_indices[msg_id] = len(self._incoming)
+            future.set_result(response)
+            del self._pending_responses[msg_id]
 
-        for msg_id in found:
-            self._pending_responses.pop(msg_id).set_result(response)
-
-        found.clear()
-        for msg_id in self._pending_replies:
+        for msg_id, future in list(self._pending_replies.items()):
             if msg_id == response.reply_to_msg_id:
-                found.append(msg_id)
                 self._reply_indices[msg_id] = len(self._incoming)
-
-        for msg_id in found:
-            self._pending_replies.pop(msg_id).set_result(response)
+                future.set_result(response)
+                del self._pending_replies[msg_id]
 
     def _on_edit(self, message):
         message = message.message
         if message.chat_id != self.chat_id or message.out:
             return
 
-        found = []
-        for msg_id, pending in self._pending_edits.items():
+        for msg_id, future in list(self._pending_edits.items()):
             if msg_id < message.id:
-                found.append(msg_id)
-                self._edit_dates[msg_id] = message.edit_date.timestamp()
+                edit_ts = message.edit_date.timestamp()
 
-        for msg_id in found:
-            self._pending_edits.pop(msg_id).set_result(message)
+                # We compare <= because edit_ts resolution is always to
+                # seconds, but we may have increased _edit_dates before.
+                # Since the dates are ever growing this is not a problem.
+                if edit_ts <= self._edit_dates.get(msg_id, 0):
+                    self._edit_dates[msg_id] += _EDIT_COLLISION_DELTA
+                else:
+                    self._edit_dates[msg_id] = message.edit_date.timestamp()
+
+                future.set_result(message)
+                del self._pending_edits[msg_id]
 
     def _on_read(self, event):
         if event.chat_id != self.chat_id or event.inbox:
@@ -343,23 +351,27 @@ class Conversation(ChatGetter):
         self._last_read = event.max_id
 
         remove_reads = []
-        for msg_id, pending in self._pending_reads.items():
+        for msg_id, pending in list(self._pending_reads.items()):
             if msg_id >= self._last_read:
                 remove_reads.append(msg_id)
                 pending.set_result(True)
+                del self._pending_reads[msg_id]
 
         for to_remove in remove_reads:
             del self._pending_reads[to_remove]
 
     def _get_message_id(self, message):
-        if message:
+        if message is not None:  # 0 is valid but false-y, check for None
             return message if isinstance(message, int) else message.id
         elif self._last_outgoing:
             return self._last_outgoing
         else:
             raise ValueError('No message was sent previously')
 
-    def _get_result(self, future, start_time, timeout):
+    def _get_result(self, future, start_time, timeout, pending, target_id):
+        if self._cancelled:
+            raise asyncio.CancelledError('The conversation was cancelled before')
+
         due = self._total_due
         if timeout is None:
             timeout = self._timeout
@@ -367,6 +379,11 @@ class Conversation(ChatGetter):
         if timeout is not None:
             due = min(due, start_time + timeout)
 
+        # NOTE: We can't try/finally to pop from pending here because
+        #       the event loop needs to get back to us, but it might
+        #       dispatch another update before, and in that case a
+        #       response could be set twice. So responses must be
+        #       cleared when their futures are set to a result.
         return asyncio.wait_for(
             future,
             timeout=None if due == float('inf') else due - time.time(),
@@ -374,6 +391,7 @@ class Conversation(ChatGetter):
         )
 
     def _cancel_all(self, exception=None):
+        self._cancelled = True
         for pending in itertools.chain(
                 self._pending_responses.values(),
                 self._pending_replies.values(),
@@ -389,15 +407,6 @@ class Conversation(ChatGetter):
             else:
                 fut.cancel()
 
-    def __enter__(self):
-        if self._client.loop.is_running():
-            raise RuntimeError(
-                'You must use "async with" if the event loop '
-                'is running (i.e. you are inside an "async def")'
-            )
-
-        return self._client.loop.run_until_complete(self.__aenter__())
-
     async def __aenter__(self):
         self._input_chat = \
             await self._client.get_input_entity(self._input_chat)
@@ -406,12 +415,12 @@ class Conversation(ChatGetter):
 
         # Make sure we're the only conversation in this chat if it's exclusive
         chat_id = utils.get_peer_id(self._chat_peer)
-        count = self._client._ids_in_conversations.get(chat_id, 0)
-        if self._exclusive and count:
+        conv_set = self._client._conversations[chat_id]
+        if self._exclusive and conv_set:
             raise errors.AlreadyInConversationError()
 
-        self._client._ids_in_conversations[chat_id] = count + 1
-        self._client._conversations[self._id] = self
+        conv_set.add(self)
+        self._cancelled = False
 
         self._last_outgoing = 0
         self._last_incoming = 0
@@ -430,23 +439,33 @@ class Conversation(ChatGetter):
         return self
 
     def cancel(self):
-        """Cancels the current conversation and exits the context manager."""
-        raise _ConversationCancelled()
+        """
+        Cancels the current conversation. Pending responses and subsequent
+        calls to get a response will raise ``asyncio.CancelledError``.
 
-    def __exit__(self, *args):
-        return self._client.loop.run_until_complete(self.__aexit__(*args))
+        This method is synchronous and should not be awaited.
+        """
+        self._cancel_all()
+
+    async def cancel_all(self):
+        """
+        Calls `cancel` on *all* conversations in this chat.
+
+        Note that you should ``await`` this method, since it's meant to be
+        used outside of a context manager, and it needs to resolve the chat.
+        """
+        chat_id = await self._client.get_peer_id(self._input_chat)
+        for conv in self._client._conversations[chat_id]:
+            conv.cancel()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         chat_id = utils.get_peer_id(self._chat_peer)
-        if self._client._ids_in_conversations[chat_id] == 1:
-            del self._client._ids_in_conversations[chat_id]
-        else:
-            self._client._ids_in_conversations[chat_id] -= 1
+        conv_set = self._client._conversations[chat_id]
+        conv_set.discard(self)
+        if not conv_set:
+            del self._client._conversations[chat_id]
 
-        del self._client._conversations[self._id]
         self._cancel_all()
-        return isinstance(exc_val, _ConversationCancelled)
 
-
-class _ConversationCancelled(InterruptedError):
-    pass
+    __enter__ = helpers._sync_enter
+    __exit__ = helpers._sync_exit

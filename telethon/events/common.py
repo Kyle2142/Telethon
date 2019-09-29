@@ -1,9 +1,10 @@
 import abc
 import asyncio
+import itertools
 import warnings
 
 from .. import utils
-from ..tl import TLObject, types
+from ..tl import TLObject, types, functions
 from ..tl.custom.chatgetter import ChatGetter
 
 
@@ -65,19 +66,26 @@ class EventBuilder(abc.ABC):
                 async def handler(event):
                     pass  # code here
     """
-    self_id = None
-
     def __init__(self, chats=None, *, blacklist_chats=False, func=None):
         self.chats = chats
-        self.blacklist_chats = blacklist_chats
+        self.blacklist_chats = bool(blacklist_chats)
         self.resolved = False
         self.func = func
         self._resolve_lock = None
 
     @classmethod
     @abc.abstractmethod
-    def build(cls, update):
-        """Builds an event for the given update if possible, or returns None"""
+    def build(cls, update, others=None, self_id=None):
+        """
+        Builds an event for the given update if possible, or returns None.
+
+        `others` are the rest of updates that came in the same container
+        as the current `update`.
+
+        `self_id` should be the current user's ID, since it is required
+        for some events which lack this information but still need it.
+        """
+        # TODO So many parameters specific to only some update types seems dirty
 
     async def resolve(self, client):
         """Helper method to allow event builders to be resolved before usage"""
@@ -94,13 +102,11 @@ class EventBuilder(abc.ABC):
 
     async def _resolve(self, client):
         self.chats = await _into_id_set(client, self.chats)
-        if not EventBuilder.self_id:
-            EventBuilder.self_id = await client.get_peer_id('me')
 
     def filter(self, event):
         """
         If the ID of ``event._chat_peer`` isn't in the chats set (or it is
-        but the set is a blacklist) returns ``None``, otherwise the event.
+        but the set is a blacklist) returns `None`, otherwise the event.
 
         The events must have been resolved before this can be called.
         """
@@ -108,7 +114,8 @@ class EventBuilder(abc.ABC):
             return None
 
         if self.chats is not None:
-            inside = utils.get_peer_id(event._chat_peer) in self.chats
+            # Note: the `event.chat_id` property checks if it's `None` for us
+            inside = event.chat_id in self.chats
             if inside == self.blacklist_chats:
                 # If this chat matches but it's a blacklist ignore.
                 # If it doesn't match but it's a whitelist ignore.
@@ -131,14 +138,11 @@ class EventCommon(ChatGetter, abc.ABC):
     """
     _event_name = 'Event'
 
-    def __init__(self, chat_peer=None, msg_id=None, broadcast=False):
+    def __init__(self, chat_peer=None, msg_id=None, broadcast=None):
+        super().__init__(chat_peer, broadcast=broadcast)
         self._entities = {}
         self._client = None
-        self._chat_peer = chat_peer
         self._message_id = msg_id
-        self._input_chat = None
-        self._chat = None
-        self._broadcast = broadcast
         self.original_update = None
 
     def _set_client(self, client):
@@ -146,19 +150,11 @@ class EventCommon(ChatGetter, abc.ABC):
         Setter so subclasses can act accordingly when the client is set.
         """
         self._client = client
-        self._chat = self._entities.get(self.chat_id)
-        if not self._chat:
-            return
-
-        try:
-            self._input_chat = utils.get_input_peer(self._chat)
-        except TypeError:
-            try:
-                self._input_chat = self._client.session.get_input_entity(
-                    self._chat_peer
-                )
-            except ValueError:
-                self._input_chat = None
+        if self._chat_peer:
+            self._chat, self._input_chat = utils._get_entity_pair(
+                self.chat_id, self._entities, client._entity_cache)
+        else:
+            self._chat = self._input_chat = None
 
     @property
     def client(self):

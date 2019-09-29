@@ -12,9 +12,9 @@ Extra supported commands are:
 
 import itertools
 import json
+import os
 import re
 import shutil
-from os import chdir
 from pathlib import Path
 from subprocess import run
 from sys import argv
@@ -26,16 +26,19 @@ class TempWorkDir:
     """Switches the working directory to be the one on which this file lives,
        while within the 'with' block.
     """
-    def __init__(self):
+    def __init__(self, new=None):
         self.original = None
+        self.new = new or str(Path(__file__).parent.resolve())
 
     def __enter__(self):
-        self.original = Path('.')
-        chdir(str(Path(__file__).parent))
+        # os.chdir does not work with Path in Python 3.5.x
+        self.original = str(Path('.').resolve())
+        os.makedirs(self.new, exist_ok=True)
+        os.chdir(self.new)
         return self
 
     def __exit__(self, *args):
-        chdir(str(self.original))
+        os.chdir(self.original)
 
 
 GENERATOR_DIR = Path('telethon_generator')
@@ -46,6 +49,9 @@ ERRORS_OUT = LIBRARY_DIR / 'errors/rpcerrorlist.py'
 
 METHODS_IN = GENERATOR_DIR / 'data/methods.csv'
 
+# Which raw API methods are covered by *friendly* methods in the client?
+FRIENDLY_IN = GENERATOR_DIR / 'data/friendly.csv'
+
 TLOBJECT_IN_TLS = [Path(x) for x in GENERATOR_DIR.glob('data/*.tl')]
 TLOBJECT_OUT = LIBRARY_DIR / 'tl'
 IMPORT_DEPTH = 2
@@ -54,7 +60,7 @@ DOCS_IN_RES = GENERATOR_DIR / 'data/html'
 DOCS_OUT = Path('docs')
 
 
-def generate(which):
+def generate(which, action='gen'):
     from telethon_generator.parsers import\
         parse_errors, parse_methods, parse_tl, find_layer
 
@@ -63,7 +69,7 @@ def generate(which):
 
     layer = next(filter(None, map(find_layer, TLOBJECT_IN_TLS)))
     errors = list(parse_errors(ERRORS_IN))
-    methods = list(parse_methods(METHODS_IN, {e.str_code: e for e in errors}))
+    methods = list(parse_methods(METHODS_IN, FRIENDLY_IN, {e.str_code: e for e in errors}))
 
     tlobjects = list(itertools.chain(*(
         parse_tl(file, layer, methods) for file in TLOBJECT_IN_TLS)))
@@ -71,10 +77,8 @@ def generate(which):
     if not which:
         which.extend(('tl', 'errors'))
 
-    clean = 'clean' in which
+    clean = action == 'clean'
     action = 'Cleaning' if clean else 'Generating'
-    if clean:
-        which.remove('clean')
 
     if 'all' in which:
         which.remove('all')
@@ -107,7 +111,9 @@ def generate(which):
             if DOCS_OUT.is_dir():
                 shutil.rmtree(str(DOCS_OUT))
         else:
-            generate_docs(tlobjects, methods, layer, DOCS_IN_RES, DOCS_OUT)
+            in_path = DOCS_IN_RES.resolve()
+            with TempWorkDir(DOCS_OUT):
+                generate_docs(tlobjects, methods, layer, in_path)
 
     if 'json' in which:
         which.remove('json')
@@ -119,30 +125,32 @@ def generate(which):
                     file.unlink()
         else:
             def gen_json(fin, fout):
-                methods = []
+                meths = []
                 constructors = []
                 for tl in parse_tl(fin, layer):
                     if tl.is_function:
-                        methods.append(tl.to_dict())
+                        meths.append(tl.to_dict())
                     else:
                         constructors.append(tl.to_dict())
-                what = {'constructors': constructors, 'methods': methods}
+                what = {'constructors': constructors, 'methods': meths}
                 with open(fout, 'w') as f:
                     json.dump(what, f, indent=2)
 
-            for fin, fout in zip(TLOBJECT_IN_TLS, json_files):
-                gen_json(fin, fout)
+            for fs in zip(TLOBJECT_IN_TLS, json_files):
+                gen_json(*fs)
 
     if which:
-        print('The following items were not understood:', which)
-        print('  Consider using only "tl", "errors" and/or "docs".')
-        print('  Using only "clean" will clean them. "all" to act on all.')
-        print('  For instance "gen tl errors".')
+        print(
+            'The following items were not understood:', which,
+            '\n  Consider using only "tl", "errors" and/or "docs".'
+            '\n  Using only "clean" will clean them. "all" to act on all.'
+            '\n  For instance "gen tl errors".'
+        )
 
 
 def main():
-    if len(argv) >= 2 and argv[1] == 'gen':
-        generate(argv[2:])
+    if len(argv) >= 2 and argv[1] in ('gen', 'clean'):
+        generate(argv[2:], argv[1])
 
     elif len(argv) >= 2 and argv[1] == 'pypi':
         # (Re)generate the code to make sure we don't push without it
@@ -214,8 +222,7 @@ def main():
             packages=find_packages(exclude=[
                 'telethon_*', 'run_tests.py', 'try_telethon.py'
             ]),
-            install_requires=['pyaes', 'rsa',
-                              'async_generator'],
+            install_requires=['pyaes', 'rsa'],
             extras_require={
                 'cryptg': ['cryptg']
             }
@@ -223,5 +230,5 @@ def main():
 
 
 if __name__ == '__main__':
-    with TempWorkDir():  # Could just use a try/finally but this is + reusable
+    with TempWorkDir():
         main()

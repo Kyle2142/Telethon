@@ -30,14 +30,14 @@ class InlineBuilder:
             If present, it must be the contact information to send.
 
         game (`bool`, optional):
-            May be ``True`` to indicate that the game will be sent.
+            May be `True` to indicate that the game will be sent.
 
         buttons (`list`, `custom.Button <telethon.tl.custom.button.Button>`, :tl:`KeyboardButton`, optional):
-            Same as ``buttons`` for `client.send_message
+            Same as ``buttons`` for `client.send_message()
             <telethon.client.messages.MessageMethods.send_message>`.
 
         parse_mode (`str`, optional):
-            Same as ``parse_mode`` for `client.send_message
+            Same as ``parse_mode`` for `client.send_message()
             <telethon.client.messageparse.MessageParseMethods.parse_mode>`.
 
         id (`str`, optional):
@@ -56,6 +56,7 @@ class InlineBuilder:
     def __init__(self, client):
         self._client = client
 
+    # noinspection PyIncorrectDocstring
     async def article(
             self, title, description=None,
             *, url=None, thumb=None, content=None,
@@ -107,6 +108,7 @@ class InlineBuilder:
 
         return result
 
+    # noinspection PyIncorrectDocstring
     async def photo(
             self, file, *, id=None,
             text=None, parse_mode=(), link_preview=True,
@@ -117,19 +119,22 @@ class InlineBuilder:
 
         Args:
             file (`obj`, optional):
-                Same as ``file`` for `client.send_file
+                Same as ``file`` for `client.send_file()
                 <telethon.client.uploads.UploadMethods.send_file>`.
         """
         try:
             fh = utils.get_input_photo(file)
         except TypeError:
-            fh = await self._client.upload_file(file, use_cache=types.InputPhoto)
-
-        if not isinstance(fh, types.InputPhoto):
-            r = await self._client(functions.messages.UploadMediaRequest(
-                types.InputPeerSelf(), media=types.InputMediaUploadedPhoto(fh)
-            ))
-            fh = utils.get_input_photo(r.photo)
+            _, media, _ = await self._client._file_to_media(
+                file, allow_cache=True, as_image=True
+            )
+            if isinstance(media, types.InputPhoto):
+                fh = media
+            else:
+                r = await self._client(functions.messages.UploadMediaRequest(
+                    types.InputPeerSelf(), media=media
+                ))
+                fh = utils.get_input_photo(r.photo)
 
         result = types.InputBotInlineResultPhoto(
             id=id or '',
@@ -151,6 +156,7 @@ class InlineBuilder:
 
         return result
 
+    # noinspection PyIncorrectDocstring
     async def document(
             self, file, title=None, *, description=None, type=None,
             mime_type=None, attributes=None, force_document=False,
@@ -167,7 +173,7 @@ class InlineBuilder:
 
         Args:
             file (`obj`):
-                Same as ``file`` for `client.send_file
+                Same as ``file`` for `client.send_file()
                 <telethon.client.uploads.UploadMethods.send_file>`.
 
             title (`str`, optional):
@@ -191,27 +197,22 @@ class InlineBuilder:
         try:
             fh = utils.get_input_document(file)
         except TypeError:
-            use_cache = types.InputDocument if use_cache else None
-            fh = await self._client.upload_file(file, use_cache=use_cache)
-
-        if not isinstance(fh, types.InputDocument):
-            attributes, mime_type = utils.get_attributes(
+            _, media, _ = await self._client._file_to_media(
                 file,
                 mime_type=mime_type,
                 attributes=attributes,
-                force_document=force_document,
+                force_document=True,
                 voice_note=voice_note,
-                video_note=video_note
+                video_note=video_note,
+                allow_cache=use_cache
             )
-            r = await self._client(functions.messages.UploadMediaRequest(
-                types.InputPeerSelf(), media=types.InputMediaUploadedDocument(
-                    fh,
-                    mime_type=mime_type,
-                    attributes=attributes,
-                    nosound_video=None,
-                    thumb=None
-            )))
-            fh = utils.get_input_document(r.document)
+            if isinstance(media, types.InputDocument):
+                fh = media
+            else:
+                r = await self._client(functions.messages.UploadMediaRequest(
+                    types.InputPeerSelf(), media=media
+                ))
+                fh = utils.get_input_document(r.document)
 
         result = types.InputBotInlineResultDocument(
             id=id or '',
@@ -238,6 +239,7 @@ class InlineBuilder:
 
         return result
 
+    # noinspection PyIncorrectDocstring
     async def game(
             self, short_name, *, id=None,
             text=None, parse_mode=(), link_preview=True,
